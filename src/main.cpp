@@ -129,6 +129,86 @@ static bool startSd() {
   return true;
 }
 
+static void runSdStressTest() {
+  if (!sdReady) return;
+
+  constexpr uint32_t TEST_MS = 60000;
+  constexpr uint32_t TARGET_HZ = 1000;
+  constexpr uint32_t PERIOD_US = 1000000UL / TARGET_HZ;
+  const char* path = "/stress.csv";
+
+  Serial.printf("SD stress start %lu s @ %lu records/s\n",
+                (unsigned long)(TEST_MS / 1000),
+                (unsigned long)TARGET_HZ);
+
+  SD.remove(path);
+  File file = SD.open(path, FILE_WRITE);
+  if (!file) {
+    Serial.println("SD stress open FAILED");
+    return;
+  }
+
+  file.println("us,seq,id,dlc,d0,d1,d2,d3,d4,d5,d6,d7");
+
+  const uint32_t startMs = millis();
+  uint32_t nextUs = micros();
+  uint32_t seq = 0;
+  uint32_t lastFlushMs = startMs;
+
+  while (millis() - startMs < TEST_MS) {
+    const uint32_t nowUs = micros();
+    if ((int32_t)(nowUs - nextUs) < 0) {
+      delayMicroseconds(50);
+      continue;
+    }
+
+    // If an SD write took longer than one slot, resume from "now" rather
+    // than emitting a burst of fake catch-up records.
+    nextUs = nowUs + PERIOD_US;
+
+    const uint32_t id = 0x0C665500UL;
+    const uint8_t b0 = (seq >> 0) & 0xFF;
+    const uint8_t b1 = (seq >> 8) & 0xFF;
+    const uint8_t b2 = (seq >> 16) & 0xFF;
+    const uint8_t b3 = (seq >> 24) & 0xFF;
+
+    file.printf("%lu,%lu,%08lX,8,%02X,%02X,%02X,%02X,55,AA,12,34\n",
+                (unsigned long)nowUs,
+                (unsigned long)seq,
+                (unsigned long)id,
+                b0, b1, b2, b3);
+    ++seq;
+
+    const uint32_t nowMs = millis();
+    if (nowMs - lastFlushMs >= 1000) {
+      file.flush();
+      lastFlushMs = nowMs;
+      Serial.printf("SD stress %lu s records=%lu\n",
+                    (unsigned long)((nowMs - startMs) / 1000),
+                    (unsigned long)seq);
+    }
+  }
+
+  file.flush();
+  const size_t bytesWritten = file.size();
+  file.close();
+
+  File verify = SD.open(path, FILE_READ);
+  uint32_t newlineCount = 0;
+  if (verify) {
+    while (verify.available()) {
+      if (verify.read() == '\n') ++newlineCount;
+    }
+    verify.close();
+  }
+
+  Serial.printf("SD stress DONE records=%lu bytes=%lu lines=%lu expected_lines=%lu\n",
+                (unsigned long)seq,
+                (unsigned long)bytesWritten,
+                (unsigned long)newlineCount,
+                (unsigned long)(seq + 1));
+}
+
 static bool startTwai() {
   twai_general_config_t general =
       TWAI_GENERAL_CONFIG_DEFAULT(PIN_CAN_TX, PIN_CAN_RX, TWAI_MODE_LISTEN_ONLY);
@@ -242,6 +322,7 @@ void setup() {
 
   twaiReady = startTwai();
   sdReady = startSd();
+  runSdStressTest();
   connectWifi();
   connectMqtt();
 }
