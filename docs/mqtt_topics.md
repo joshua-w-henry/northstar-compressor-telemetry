@@ -4,12 +4,24 @@ Base topic:
 
 `wayne/compressor`
 
-Planned retained/telemetry topics:
+Current topics:
 
-- `availability`
+- `availability` (retained)
+- `rpm`
+- `can/status` (retained)
+- `can/rx_count`
+- `can/error_count`
+- `can/logged_count`
+- `can/log_drop_count`
+- `nano/line_count`
+- `sd/status` (retained)
+- `sd/session` (retained)
+- `wifi/rssi`
+
+Planned decoded Nano/controller topics:
+
 - `state`
 - `fault`
-- `rpm`
 - `pressure_psi`
 - `battery_voltage`
 - `master`
@@ -20,8 +32,5 @@ Planned retained/telemetry topics:
 - `cycles`
 - `hobbs_hours`
 - `crank_min_voltage`
-- `can/rx_count`
-- `can/error_count`
-- `sd/status`
 
-Raw CAN frames are not intended to be published continuously to Home Assistant.
+Raw CAN frames are intentionally not published continuously to Home Assistant. The SD card is the authoritative raw capture path.
