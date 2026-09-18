@@ -2,6 +2,8 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <driver/twai.h>
+#include <SPI.h>
+#include <SD.h>
 
 #include "config.h"
 #include "pins.h"
@@ -26,6 +28,7 @@ WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
 
 bool twaiReady = false;
+bool sdReady = false;
 uint32_t canRxCount = 0;
 uint32_t canErrorCount = 0;
 uint16_t engineRpm = 0;
@@ -76,6 +79,54 @@ static void connectMqtt() {
     mqtt.publish(availability.c_str(), "online", true);
     Serial.println("MQTT OK");
   }
+}
+
+static bool startSd() {
+  Serial.println("SD init");
+
+  SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
+
+  // Start conservatively at 4 MHz for the first bench qualification.
+  if (!SD.begin(PIN_SD_CS, SPI, 4000000)) {
+    Serial.println("SD mount FAILED");
+    return false;
+  }
+
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("SD no card");
+    return false;
+  }
+
+  Serial.printf("SD mounted size=%llu MB\n",
+                (unsigned long long)(SD.cardSize() / (1024ULL * 1024ULL)));
+
+  File file = SD.open("/bench.txt", FILE_APPEND);
+  if (!file) {
+    Serial.println("SD open /bench.txt FAILED");
+    return false;
+  }
+
+  file.printf("BOOT ms=%lu NorthStar telemetry SD bench test\n",
+              (unsigned long)millis());
+  file.flush();
+  file.close();
+  Serial.println("SD write /bench.txt OK");
+
+  file = SD.open("/bench.txt", FILE_READ);
+  if (!file) {
+    Serial.println("SD reopen /bench.txt FAILED");
+    return false;
+  }
+
+  Serial.println("SD readback BEGIN");
+  while (file.available()) {
+    Serial.write(file.read());
+  }
+  file.close();
+  Serial.println("SD readback END");
+
+  return true;
 }
 
 static bool startTwai() {
@@ -190,6 +241,7 @@ void setup() {
   NanoSerial.begin(NANO_SERIAL_BAUD, SERIAL_8N1, PIN_NANO_RX, -1);
 
   twaiReady = startTwai();
+  sdReady = startSd();
   connectWifi();
   connectMqtt();
 }
