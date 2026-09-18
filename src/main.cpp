@@ -4,6 +4,8 @@
 #include <driver/twai.h>
 #include <SPI.h>
 #include <SD.h>
+#include <time.h>
+#include <sys/time.h>
 
 #include "config.h"
 #include "pins.h"
@@ -27,73 +29,96 @@ HardwareSerial NanoSerial(1);
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
 
+File canLog;
+File nanoLog;
+
 bool twaiReady = false;
 bool sdReady = false;
+bool wifiAttemptActive = false;
+bool wifiWasConnected = false;
+bool ntpStarted = false;
+
+uint8_t wifiIndex = 0;
+uint16_t sessionNumber = 0;
+
 uint32_t canRxCount = 0;
 uint32_t canErrorCount = 0;
+uint32_t canLogCount = 0;
+uint32_t canLogDropCount = 0;
+uint32_t nanoLineCount = 0;
 uint16_t engineRpm = 0;
-unsigned long lastWifiAttemptMs = 0;
+
+unsigned long wifiAttemptStartedMs = 0;
+unsigned long wifiNextAttemptMs = 0;
 unsigned long lastMqttAttemptMs = 0;
 unsigned long lastFastPublishMs = 0;
 unsigned long lastSlowPublishMs = 0;
+unsigned long lastSdFlushMs = 0;
 
-static void connectWifi() {
-  if (WiFi.status() == WL_CONNECTED) return;
+static uint64_t epochMsNow() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  if (tv.tv_sec < 1700000000) return 0;  // clock not synchronized yet
+  return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)(tv.tv_usec / 1000);
+}
 
-  const char* ssids[] = {WIFI_SSID_1, WIFI_SSID_2};
-  const char* passes[] = {WIFI_PASS_1, WIFI_PASS_2};
+static void publishText(const char* suffix, const char* value, bool retained = false) {
+  if (!mqtt.connected()) return;
+  String topic = String(MQTT_BASE_TOPIC) + "/" + suffix;
+  mqtt.publish(topic.c_str(), value, retained);
+}
 
-  for (uint8_t i = 0; i < 2 && WiFi.status() != WL_CONNECTED; ++i) {
-    if (!strcmp(ssids[i], "CHANGE_ME")) continue;
+static bool openSessionLogs() {
+  if (!sdReady) return false;
 
-    Serial.printf("WIFI try %s\n", ssids[i]);
-    WiFi.begin(ssids[i], passes[i]);
+  char canPath[24];
+  char nanoPath[24];
 
-    const unsigned long started = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - started < 7000) {
-      delay(50);
+  for (uint16_t n = 1; n < 10000; ++n) {
+    snprintf(canPath, sizeof(canPath), "/can_%04u.csv", n);
+    if (!SD.exists(canPath)) {
+      sessionNumber = n;
+      break;
     }
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("WIFI OK %s IP=%s RSSI=%d\n",
-                  WiFi.SSID().c_str(),
-                  WiFi.localIP().toString().c_str(),
-                  WiFi.RSSI());
+  if (!sessionNumber) {
+    Serial.println("SD no free session filename");
+    return false;
   }
-}
 
-static void connectMqtt() {
-  if (mqtt.connected() || WiFi.status() != WL_CONNECTED) return;
+  snprintf(canPath, sizeof(canPath), "/can_%04u.csv", sessionNumber);
+  snprintf(nanoPath, sizeof(nanoPath), "/nano_%04u.log", sessionNumber);
 
-  String availability = String(MQTT_BASE_TOPIC) + "/availability";
-  Serial.println("MQTT connect");
+  canLog = SD.open(canPath, FILE_WRITE);
+  nanoLog = SD.open(nanoPath, FILE_WRITE);
 
-  if (mqtt.connect(MQTT_CLIENT_ID,
-                   MQTT_USER,
-                   MQTT_PASS,
-                   availability.c_str(),
-                   0,
-                   true,
-                   "offline")) {
-    mqtt.publish(availability.c_str(), "online", true);
-    Serial.println("MQTT OK");
+  if (!canLog || !nanoLog) {
+    Serial.println("SD session log open FAILED");
+    if (canLog) canLog.close();
+    if (nanoLog) nanoLog.close();
+    return false;
   }
+
+  canLog.println("mono_us,epoch_ms,seq,frame,id,dlc,d0,d1,d2,d3,d4,d5,d6,d7");
+  nanoLog.println("# mono_ms,epoch_ms,line");
+  canLog.flush();
+  nanoLog.flush();
+
+  Serial.printf("SD session %04u logging ready\n", sessionNumber);
+  return true;
 }
 
 static bool startSd() {
   Serial.println("SD init");
-
   SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
 
-  // Start conservatively at 4 MHz for the first bench qualification.
-  if (!SD.begin(PIN_SD_CS, SPI, 4000000)) {
+  if (!SD.begin(PIN_SD_CS, SPI, SD_SPI_HZ)) {
     Serial.println("SD mount FAILED");
     return false;
   }
 
-  uint8_t cardType = SD.cardType();
-  if (cardType == CARD_NONE) {
+  if (SD.cardType() == CARD_NONE) {
     Serial.println("SD no card");
     return false;
   }
@@ -101,119 +126,68 @@ static bool startSd() {
   Serial.printf("SD mounted size=%llu MB\n",
                 (unsigned long long)(SD.cardSize() / (1024ULL * 1024ULL)));
 
-  File file = SD.open("/bench.txt", FILE_APPEND);
-  if (!file) {
-    Serial.println("SD open /bench.txt FAILED");
+  sdReady = true;
+  if (!openSessionLogs()) {
+    sdReady = false;
     return false;
   }
-
-  file.printf("BOOT ms=%lu NorthStar telemetry SD bench test\n",
-              (unsigned long)millis());
-  file.flush();
-  file.close();
-  Serial.println("SD write /bench.txt OK");
-
-  file = SD.open("/bench.txt", FILE_READ);
-  if (!file) {
-    Serial.println("SD reopen /bench.txt FAILED");
-    return false;
-  }
-
-  Serial.println("SD readback BEGIN");
-  while (file.available()) {
-    Serial.write(file.read());
-  }
-  file.close();
-  Serial.println("SD readback END");
 
   return true;
 }
 
-static void runSdStressTest() {
+static void flushLogsIfDue() {
   if (!sdReady) return;
 
-  constexpr uint32_t TEST_MS = 60000;
-  constexpr uint32_t TARGET_HZ = 1000;
-  constexpr uint32_t PERIOD_US = 1000000UL / TARGET_HZ;
-  const char* path = "/stress.csv";
+  const unsigned long now = millis();
+  if (now - lastSdFlushMs < SD_FLUSH_PERIOD_MS) return;
 
-  Serial.printf("SD stress start %lu s @ %lu records/s\n",
-                (unsigned long)(TEST_MS / 1000),
-                (unsigned long)TARGET_HZ);
+  lastSdFlushMs = now;
+  if (canLog) canLog.flush();
+  if (nanoLog) nanoLog.flush();
+}
 
-  SD.remove(path);
-  File file = SD.open(path, FILE_WRITE);
-  if (!file) {
-    Serial.println("SD stress open FAILED");
+static void logCanFrame(const twai_message_t& msg) {
+  if (!sdReady || !canLog) {
+    ++canLogDropCount;
     return;
   }
 
-  file.println("us,seq,id,dlc,d0,d1,d2,d3,d4,d5,d6,d7");
+  const uint64_t epoch = epochMsNow();
+  const uint32_t monoUs = micros();
 
-  const uint32_t startMs = millis();
-  uint32_t nextUs = micros();
-  uint32_t seq = 0;
-  uint32_t lastFlushMs = startMs;
+  canLog.printf("%lu,%llu,%lu,%c,%08lX,%u",
+                (unsigned long)monoUs,
+                (unsigned long long)epoch,
+                (unsigned long)canLogCount,
+                msg.extd ? 'X' : 'S',
+                (unsigned long)msg.identifier,
+                msg.data_length_code);
 
-  while (millis() - startMs < TEST_MS) {
-    const uint32_t nowUs = micros();
-    if ((int32_t)(nowUs - nextUs) < 0) {
-      delayMicroseconds(50);
-      continue;
-    }
-
-    // If an SD write took longer than one slot, resume from "now" rather
-    // than emitting a burst of fake catch-up records.
-    nextUs = nowUs + PERIOD_US;
-
-    const uint32_t id = 0x0C665500UL;
-    const uint8_t b0 = (seq >> 0) & 0xFF;
-    const uint8_t b1 = (seq >> 8) & 0xFF;
-    const uint8_t b2 = (seq >> 16) & 0xFF;
-    const uint8_t b3 = (seq >> 24) & 0xFF;
-
-    file.printf("%lu,%lu,%08lX,8,%02X,%02X,%02X,%02X,55,AA,12,34\n",
-                (unsigned long)nowUs,
-                (unsigned long)seq,
-                (unsigned long)id,
-                b0, b1, b2, b3);
-    ++seq;
-
-    const uint32_t nowMs = millis();
-    if (nowMs - lastFlushMs >= 1000) {
-      file.flush();
-      lastFlushMs = nowMs;
-      Serial.printf("SD stress %lu s records=%lu\n",
-                    (unsigned long)((nowMs - startMs) / 1000),
-                    (unsigned long)seq);
+  for (uint8_t i = 0; i < 8; ++i) {
+    if (i < msg.data_length_code) {
+      canLog.printf(",%02X", msg.data[i]);
+    } else {
+      canLog.print(",");
     }
   }
+  canLog.println();
+  ++canLogCount;
+}
 
-  file.flush();
-  const size_t bytesWritten = file.size();
-  file.close();
+static void logNanoLine(const char* line) {
+  if (!sdReady || !nanoLog) return;
 
-  File verify = SD.open(path, FILE_READ);
-  uint32_t newlineCount = 0;
-  if (verify) {
-    while (verify.available()) {
-      if (verify.read() == '\n') ++newlineCount;
-    }
-    verify.close();
-  }
-
-  Serial.printf("SD stress DONE records=%lu bytes=%lu lines=%lu expected_lines=%lu\n",
-                (unsigned long)seq,
-                (unsigned long)bytesWritten,
-                (unsigned long)newlineCount,
-                (unsigned long)(seq + 1));
+  nanoLog.printf("%lu,%llu,%s\n",
+                 (unsigned long)millis(),
+                 (unsigned long long)epochMsNow(),
+                 line);
+  ++nanoLineCount;
 }
 
 static bool startTwai() {
   twai_general_config_t general =
       TWAI_GENERAL_CONFIG_DEFAULT(PIN_CAN_TX, PIN_CAN_RX, TWAI_MODE_LISTEN_ONLY);
 
-  // Compressor bus is currently known to run at 500 kbit/s.
   twai_timing_config_t timing = TWAI_TIMING_CONFIG_500KBITS();
   twai_filter_config_t filter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
@@ -239,21 +213,12 @@ static void processCan() {
   while (twai_receive(&msg, 0) == ESP_OK) {
     ++canRxCount;
 
-    uint32_t id = msg.identifier;
-    if (msg.extd && id == RPM_CAN_ID && msg.data_length_code >= 4) {
-      engineRpm = ((uint16_t)msg.data[2] << 8) | msg.data[3];
+    if (msg.extd && msg.identifier == RPM_CAN_ID && msg.data_length_code >= 4) {
+      const uint16_t rpm = ((uint16_t)msg.data[2] << 8) | msg.data[3];
+      if (rpm <= 4000) engineRpm = rpm;
     }
 
-    // Phase 1 CAN vacuum: print frames to USB serial.
-    // SD logging will consume the same frame stream next.
-    Serial.printf("CAN %c %08lX [%u]",
-                  msg.extd ? 'X' : 'S',
-                  (unsigned long)id,
-                  msg.data_length_code);
-    for (uint8_t i = 0; i < msg.data_length_code; ++i) {
-      Serial.printf(" %02X", msg.data[i]);
-    }
-    Serial.println();
+    logCanFrame(msg);
   }
 
   twai_status_info_t status;
@@ -265,18 +230,19 @@ static void processCan() {
 }
 
 static void processNanoUart() {
-  // Phase 1: one-way Nano -> ESP32.
-  // For now echo complete lines to USB serial. A structured parser comes next.
-  static char line[160];
+  static char line[192];
   static size_t len = 0;
 
   while (NanoSerial.available()) {
-    char c = (char)NanoSerial.read();
+    const char c = (char)NanoSerial.read();
     if (c == '\r') continue;
 
     if (c == '\n') {
       line[len] = 0;
-      if (len) Serial.printf("NANO %s\n", line);
+      if (len) {
+        Serial.printf("NANO %s\n", line);
+        logNanoLine(line);
+      }
       len = 0;
     } else if (len < sizeof(line) - 1) {
       line[len++] = c;
@@ -286,27 +252,136 @@ static void processNanoUart() {
   }
 }
 
+static void beginWifiAttempt(uint8_t index) {
+  const char* ssids[] = {WIFI_SSID_1, WIFI_SSID_2};
+  const char* passes[] = {WIFI_PASS_1, WIFI_PASS_2};
+
+  if (!strcmp(ssids[index], "CHANGE_ME") || !strlen(ssids[index])) {
+    wifiIndex = (index + 1) % 2;
+    wifiNextAttemptMs = millis() + WIFI_RETRY_PERIOD_MS;
+    return;
+  }
+
+  WiFi.disconnect();
+  Serial.printf("WIFI try %s\n", ssids[index]);
+  WiFi.begin(ssids[index], passes[index]);
+
+  wifiAttemptActive = true;
+  wifiAttemptStartedMs = millis();
+}
+
+static void serviceWifi() {
+  const wl_status_t status = WiFi.status();
+  const unsigned long now = millis();
+
+  if (status == WL_CONNECTED) {
+    wifiAttemptActive = false;
+
+    if (!wifiWasConnected) {
+      wifiWasConnected = true;
+      Serial.printf("WIFI OK %s IP=%s RSSI=%d\n",
+                    WiFi.SSID().c_str(),
+                    WiFi.localIP().toString().c_str(),
+                    WiFi.RSSI());
+
+      if (!ntpStarted) {
+        configTime(0, 0, "pool.ntp.org", "time.google.com");
+        ntpStarted = true;
+        Serial.println("NTP sync requested");
+      }
+    }
+    return;
+  }
+
+  if (wifiWasConnected) {
+    wifiWasConnected = false;
+    Serial.println("WIFI lost");
+  }
+
+  if (wifiAttemptActive) {
+    if (now - wifiAttemptStartedMs < WIFI_CONNECT_TIMEOUT_MS) return;
+
+    wifiAttemptActive = false;
+    WiFi.disconnect();
+    wifiIndex = (wifiIndex + 1) % 2;
+    wifiNextAttemptMs = now + WIFI_RETRY_PERIOD_MS;
+    return;
+  }
+
+  if ((int32_t)(now - wifiNextAttemptMs) >= 0) {
+    beginWifiAttempt(wifiIndex);
+  }
+}
+
+static void connectMqtt() {
+  if (mqtt.connected() || WiFi.status() != WL_CONNECTED) return;
+
+  const String availability = String(MQTT_BASE_TOPIC) + "/availability";
+  Serial.println("MQTT connect");
+
+  if (mqtt.connect(MQTT_CLIENT_ID,
+                   MQTT_USER,
+                   MQTT_PASS,
+                   availability.c_str(),
+                   0,
+                   true,
+                   "offline")) {
+    mqtt.publish(availability.c_str(), "online", true);
+    publishText("sd/status", sdReady ? "online" : "fault", true);
+    publishText("can/status", twaiReady ? "listen_only" : "fault", true);
+    Serial.println("MQTT OK");
+  }
+}
+
+static void serviceMqtt() {
+  const unsigned long now = millis();
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  if (!mqtt.connected()) {
+    if (now - lastMqttAttemptMs >= MQTT_RETRY_PERIOD_MS) {
+      lastMqttAttemptMs = now;
+      connectMqtt();
+    }
+    return;
+  }
+
+  mqtt.loop();
+}
+
 static void publishFast() {
   if (!mqtt.connected()) return;
 
   char payload[24];
   snprintf(payload, sizeof(payload), "%u", engineRpm);
-  String topic = String(MQTT_BASE_TOPIC) + "/rpm";
-  mqtt.publish(topic.c_str(), payload, false);
+  publishText("rpm", payload, false);
 }
 
 static void publishSlow() {
   if (!mqtt.connected()) return;
 
-  char payload[32];
+  char payload[40];
 
   snprintf(payload, sizeof(payload), "%lu", (unsigned long)canRxCount);
-  String rxTopic = String(MQTT_BASE_TOPIC) + "/can/rx_count";
-  mqtt.publish(rxTopic.c_str(), payload, false);
+  publishText("can/rx_count", payload, false);
 
   snprintf(payload, sizeof(payload), "%lu", (unsigned long)canErrorCount);
-  String errTopic = String(MQTT_BASE_TOPIC) + "/can/error_count";
-  mqtt.publish(errTopic.c_str(), payload, false);
+  publishText("can/error_count", payload, false);
+
+  snprintf(payload, sizeof(payload), "%lu", (unsigned long)canLogCount);
+  publishText("can/logged_count", payload, false);
+
+  snprintf(payload, sizeof(payload), "%lu", (unsigned long)canLogDropCount);
+  publishText("can/log_drop_count", payload, false);
+
+  snprintf(payload, sizeof(payload), "%lu", (unsigned long)nanoLineCount);
+  publishText("nano/line_count", payload, false);
+
+  snprintf(payload, sizeof(payload), "%d", WiFi.RSSI());
+  publishText("wifi/rssi", payload, false);
+
+  snprintf(payload, sizeof(payload), "%u", sessionNumber);
+  publishText("sd/session", payload, true);
 }
 
 void setup() {
@@ -316,35 +391,29 @@ void setup() {
   Serial.println("NorthStar ESP32-S3 telemetry boot");
 
   WiFi.mode(WIFI_STA);
+
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setSocketTimeout(1);
+  mqtt.setKeepAlive(30);
 
   NanoSerial.begin(NANO_SERIAL_BAUD, SERIAL_8N1, PIN_NANO_RX, -1);
 
   twaiReady = startTwai();
-  sdReady = startSd();
-  runSdStressTest();
-  connectWifi();
-  connectMqtt();
+  startSd();
+
+  wifiNextAttemptMs = 0;
+  serviceWifi();
 }
 
 void loop() {
   processCan();
   processNanoUart();
+  flushLogsIfDue();
+
+  serviceWifi();
+  serviceMqtt();
 
   const unsigned long now = millis();
-
-  if (WiFi.status() != WL_CONNECTED &&
-      now - lastWifiAttemptMs >= WIFI_RETRY_PERIOD_MS) {
-    lastWifiAttemptMs = now;
-    connectWifi();
-  }
-
-  if (!mqtt.connected() && now - lastMqttAttemptMs >= 5000) {
-    lastMqttAttemptMs = now;
-    connectMqtt();
-  }
-
-  if (mqtt.connected()) mqtt.loop();
 
   if (now - lastFastPublishMs >= MQTT_FAST_PERIOD_MS) {
     lastFastPublishMs = now;
