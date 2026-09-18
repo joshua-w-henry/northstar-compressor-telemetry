@@ -10,20 +10,45 @@ The ESP32 may observe:
 - raw engine CAN in TWAI listen-only mode
 - its own power/network/storage health
 
-The ESP32 may publish data externally, but Phase 1 provides no path for MQTT, Wi-Fi, USB, or Home Assistant to actuate compressor outputs.
+The ESP32 may publish data externally, but there is no path for MQTT, Wi-Fi, USB, or Home Assistant to actuate compressor outputs.
 
 ## Data paths
 
 ```text
 Engine CAN ----> SN65HVD230 ----> ESP32-S3 TWAI ----> SD raw log
                                            |
-Nano TX ---> divider ---> ESP32 UART ------+----> MQTT ----> Home Assistant
+Nano TX ---> divider ---> ESP32 UART ------+----> SD event log
                                            |
-                                           +----> idle-time upload ----> UNICORN
+                                           +----> MQTT ----> Home Assistant
+                                           |
+                                           +----> later idle-time upload ----> UNICORN
 ```
 
-## Logging philosophy
+## Current logging behavior
 
-Raw CAN is retained for later analysis. Home Assistant receives decoded and operationally useful signals rather than the entire raw CAN firehose.
+The ESP32 creates a new numbered session pair on each boot:
 
-Each compressor run should eventually become a separate log file with timestamped raw CAN frames plus controller events.
+- `/can_0001.csv`, `/can_0002.csv`, ...
+- `/nano_0001.log`, `/nano_0002.log`, ...
+
+The CAN file records every received classical CAN frame with:
+
+- monotonic microsecond timestamp
+- wall-clock epoch milliseconds when NTP is available
+- sequence number
+- standard/extended flag
+- CAN identifier
+- DLC
+- up to eight data bytes
+
+The Nano file preserves every complete UART line with monotonic and wall-clock timestamps.
+
+Files are flushed once per second. Local SD logging is authoritative; Wi-Fi and MQTT are secondary and must not be required for capture.
+
+## Time
+
+The logger starts immediately without waiting for Wi-Fi. Monotonic timestamps are always present. Once Wi-Fi is available, NTP is requested and subsequent records also carry wall-clock epoch time.
+
+## Next logging refinement
+
+Once the Nano telemetry line format is frozen, session rotation can move from one-file-pair-per-boot to one-file-pair-per-compressor-run. Completed run logs can then be uploaded to UNICORN while idle.
