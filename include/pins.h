@@ -12,7 +12,8 @@ constexpr gpio_num_t PIN_CAN_RX = GPIO_NUM_16;
 constexpr int PIN_NANO_RX = 18;
 
 // microSD SPI
-constexpr int PIN_SD_CS   = 10;
-constexpr int PIN_SD_SCK  = 12;
-constexpr int PIN_SD_MISO = 13;
-constexpr int PIN_SD_MOSI = 11;
+// microSD SPI - diagnostic remap away from GPIO10-13
+constexpr int PIN_SD_CS   = 4;
+constexpr int PIN_SD_MOSI = 5;
+constexpr int PIN_SD_SCK  = 6;
+constexpr int PIN_SD_MISO = 7;
