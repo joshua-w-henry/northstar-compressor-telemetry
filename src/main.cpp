@@ -6,6 +6,7 @@
 #include <SD.h>
 #include <time.h>
 #include <sys/time.h>
+#include <esp_timer.h>
 
 #include "config.h"
 #include "pins.h"
@@ -48,6 +49,14 @@ uint32_t canLogDropCount = 0;
 uint32_t nanoLineCount = 0;
 uint16_t engineRpm = 0;
 
+uint32_t sdMountAttempts = 0;
+uint32_t sdMountFailures = 0;
+uint32_t sdWriteErrors = 0;
+uint64_t sdBytesWritten = 0;
+unsigned long sdLastWriteMs = 0;
+bool sdLastWriteOk = false;
+char sdLastError[48] = "not_initialized";
+
 struct ControllerStatus {
   bool valid = false;
   char mode[8] = "";
@@ -80,6 +89,7 @@ unsigned long lastMqttAttemptMs = 0;
 unsigned long lastFastPublishMs = 0;
 unsigned long lastSlowPublishMs = 0;
 unsigned long lastSdFlushMs = 0;
+unsigned long lastSdHealthPublishMs = 0;
 
 static uint64_t epochMsNow() {
   struct timeval tv;
@@ -92,6 +102,103 @@ static void publishText(const char* suffix, const char* value, bool retained = f
   if (!mqtt.connected()) return;
   String topic = String(MQTT_BASE_TOPIC) + "/" + suffix;
   mqtt.publish(topic.c_str(), value, retained);
+}
+
+static void setSdError(const char* error) {
+  strncpy(sdLastError, error, sizeof(sdLastError) - 1);
+  sdLastError[sizeof(sdLastError) - 1] = 0;
+  sdLastWriteOk = false;
+}
+
+static const char* sdCardTypeName() {
+  if (!sdReady) return "unavailable";
+
+  switch (SD.cardType()) {
+    case CARD_MMC:  return "MMC";
+    case CARD_SD:   return "SD";
+    case CARD_SDHC: return "SDHC_SD_XC";
+    case CARD_NONE: return "none";
+    default:        return "unknown";
+  }
+}
+
+static void noteSdWrite(size_t expected, size_t actual, const char* context) {
+  if (actual == expected) {
+    sdLastWriteOk = true;
+    sdLastWriteMs = millis();
+    sdBytesWritten += actual;
+    strncpy(sdLastError, "none", sizeof(sdLastError) - 1);
+    sdLastError[sizeof(sdLastError) - 1] = 0;
+    return;
+  }
+
+  ++sdWriteErrors;
+  sdLastWriteOk = false;
+  snprintf(sdLastError, sizeof(sdLastError), "%s_short_write", context);
+}
+
+static void publishSdHealth() {
+  if (!mqtt.connected()) return;
+
+  char payload[48];
+
+  publishText("sd/status",
+              !sdReady ? "mount_failed" :
+              (sdLastWriteOk ? "online" : "degraded"),
+              true);
+
+  publishText("sd/mounted", sdReady ? "true" : "false", true);
+  publishText("sd/card_type", sdCardTypeName(), true);
+  publishText("sd/write_ok", sdLastWriteOk ? "true" : "false", false);
+  publishText("sd/last_error", sdLastError, true);
+
+  snprintf(payload, sizeof(payload), "%lu", (unsigned long)SD_SPI_HZ);
+  publishText("sd/spi_hz", payload, true);
+
+  snprintf(payload, sizeof(payload), "%lu", (unsigned long)sdMountAttempts);
+  publishText("sd/mount_attempts", payload, false);
+
+  snprintf(payload, sizeof(payload), "%lu", (unsigned long)sdMountFailures);
+  publishText("sd/mount_failures", payload, false);
+
+  snprintf(payload, sizeof(payload), "%lu", (unsigned long)sdWriteErrors);
+  publishText("sd/write_errors", payload, false);
+
+  snprintf(payload, sizeof(payload), "%llu", (unsigned long long)sdBytesWritten);
+  publishText("sd/bytes_written", payload, false);
+
+  if (now - lastSdHealthPublishMs >= SD_HEALTH_PERIOD_MS) {
+    lastSdHealthPublishMs = now;
+    publishSdHealth();
+  }
+
+  if (sdReady) {
+    const uint64_t capacity = SD.cardSize();
+    const uint64_t total = SD.totalBytes();
+    const uint64_t used = SD.usedBytes();
+    const uint64_t freeBytes = total >= used ? total - used : 0;
+
+    snprintf(payload, sizeof(payload), "%llu",
+             (unsigned long long)(capacity / (1024ULL * 1024ULL)));
+    publishText("sd/capacity_mb", payload, true);
+
+    snprintf(payload, sizeof(payload), "%llu",
+             (unsigned long long)(used / (1024ULL * 1024ULL)));
+    publishText("sd/used_mb", payload, false);
+
+    snprintf(payload, sizeof(payload), "%llu",
+             (unsigned long long)(freeBytes / (1024ULL * 1024ULL)));
+    publishText("sd/free_mb", payload, false);
+
+    const uint32_t freePercent = total ? (uint32_t)((freeBytes * 100ULL) / total) : 0;
+    snprintf(payload, sizeof(payload), "%lu", (unsigned long)freePercent);
+    publishText("sd/free_percent", payload, false);
+
+    const unsigned long ageSec =
+        sdLastWriteMs ? (millis() - sdLastWriteMs) / 1000UL : 0;
+    snprintf(payload, sizeof(payload), "%lu", ageSec);
+    publishText("sd/last_write_age_s", payload, false);
+  }
 }
 
 static bool openSessionLogs() {
@@ -110,6 +217,7 @@ static bool openSessionLogs() {
 
   if (!sessionNumber) {
     Serial.println("SD no free session filename");
+    setSdError("no_free_session_filename");
     return false;
   }
 
@@ -121,13 +229,20 @@ static bool openSessionLogs() {
 
   if (!canLog || !nanoLog) {
     Serial.println("SD session log open FAILED");
+    setSdError("session_open_failed");
     if (canLog) canLog.close();
     if (nanoLog) nanoLog.close();
     return false;
   }
 
-  canLog.println("mono_us,epoch_ms,seq,frame,id,dlc,d0,d1,d2,d3,d4,d5,d6,d7");
-  nanoLog.println("# mono_ms,epoch_ms,line");
+  const char* canHeader = "mono_us,epoch_ms,seq,frame,id,dlc,d0,d1,d2,d3,d4,d5,d6,d7\n";
+  const char* nanoHeader = "# mono_ms,epoch_ms,line\n";
+  noteSdWrite(strlen(canHeader),
+              canLog.write((const uint8_t*)canHeader, strlen(canHeader)),
+              "can_header");
+  noteSdWrite(strlen(nanoHeader),
+              nanoLog.write((const uint8_t*)nanoHeader, strlen(nanoHeader)),
+              "nano_header");
   canLog.flush();
   nanoLog.flush();
 
@@ -147,6 +262,7 @@ static bool startSd() {
   bool mounted = false;
 
   for (uint8_t attempt = 1; attempt <= SD_INIT_ATTEMPTS; ++attempt) {
+    ++sdMountAttempts;
     Serial.printf("SD mount attempt %u/%u\n", attempt, SD_INIT_ATTEMPTS);
 
     if (SD.begin(PIN_SD_CS, SPI, SD_SPI_HZ)) {
@@ -157,10 +273,13 @@ static bool startSd() {
       }
 
       Serial.println("SD card type NONE");
+      setSdError("no_card");
     } else {
       Serial.println("SD.begin failed");
+      setSdError("mount_failed");
     }
 
+    ++sdMountFailures;
     SD.end();
     digitalWrite(PIN_SD_CS, HIGH);
 
@@ -179,6 +298,9 @@ static bool startSd() {
                 (unsigned long long)(SD.cardSize() / (1024ULL * 1024ULL)));
 
   sdReady = true;
+  sdLastWriteOk = true;
+  strncpy(sdLastError, "none", sizeof(sdLastError) - 1);
+  sdLastError[sizeof(sdLastError) - 1] = 0;
   if (!openSessionLogs()) {
     sdReady = false;
     return false;
@@ -205,34 +327,73 @@ static void logCanFrame(const twai_message_t& msg) {
   }
 
   const uint64_t epoch = epochMsNow();
-  const uint32_t monoUs = micros();
+  const uint64_t monoUs = (uint64_t)esp_timer_get_time();
 
-  canLog.printf("%lu,%llu,%lu,%c,%08lX,%u",
-                (unsigned long)monoUs,
-                (unsigned long long)epoch,
-                (unsigned long)canLogCount,
-                msg.extd ? 'X' : 'S',
-                (unsigned long)msg.identifier,
-                msg.data_length_code);
+  char line[192];
+  int len = snprintf(line, sizeof(line),
+                     "%llu,%llu,%lu,%c,%08lX,%u",
+                     (unsigned long long)monoUs,
+                     (unsigned long long)epoch,
+                     (unsigned long)canLogCount,
+                     msg.extd ? 'X' : 'S',
+                     (unsigned long)msg.identifier,
+                     msg.data_length_code);
 
-  for (uint8_t i = 0; i < 8; ++i) {
+  if (len < 0 || len >= (int)sizeof(line)) {
+    ++canLogDropCount;
+    ++sdWriteErrors;
+    setSdError("can_format_overflow");
+    return;
+  }
+
+  for (uint8_t i = 0; i < 8 && len < (int)sizeof(line) - 5; ++i) {
     if (i < msg.data_length_code) {
-      canLog.printf(",%02X", msg.data[i]);
+      len += snprintf(line + len, sizeof(line) - len, ",%02X", msg.data[i]);
     } else {
-      canLog.print(",");
+      line[len++] = ',';
+      line[len] = 0;
     }
   }
-  canLog.println();
-  ++canLogCount;
+
+  if (len >= (int)sizeof(line) - 2) {
+    ++canLogDropCount;
+    ++sdWriteErrors;
+    setSdError("can_format_overflow");
+    return;
+  }
+
+  line[len++] = '\n';
+  line[len] = 0;
+
+  const size_t written = canLog.write((const uint8_t*)line, len);
+  noteSdWrite((size_t)len, written, "can");
+
+  if (written == (size_t)len) {
+    ++canLogCount;
+  } else {
+    ++canLogDropCount;
+  }
 }
 
 static void logNanoLine(const char* line) {
   if (!sdReady || !nanoLog) return;
 
-  nanoLog.printf("%lu,%llu,%s\n",
-                 (unsigned long)millis(),
-                 (unsigned long long)epochMsNow(),
-                 line);
+  char record[256];
+  const int len = snprintf(record, sizeof(record),
+                           "%lu,%llu,%s\n",
+                           (unsigned long)millis(),
+                           (unsigned long long)epochMsNow(),
+                           line);
+
+  if (len <= 0 || len >= (int)sizeof(record)) {
+    ++sdWriteErrors;
+    setSdError("nano_format_overflow");
+    return;
+  }
+
+  noteSdWrite((size_t)len,
+              nanoLog.write((const uint8_t*)record, len),
+              "nano");
 }
 
 static bool startTwai() {
@@ -479,7 +640,7 @@ static void connectMqtt() {
                    true,
                    "offline")) {
     mqtt.publish(availability.c_str(), "online", true);
-    publishText("sd/status", sdReady ? "online" : "fault", true);
+    publishSdHealth();
     publishText("can/status", twaiReady ? "listen_only" : "fault", true);
     publishControllerState();
     Serial.println("MQTT OK");
@@ -514,6 +675,7 @@ static void publishFast() {
 static void publishSlow() {
   if (!mqtt.connected()) return;
 
+  const unsigned long now = millis();
   char payload[40];
 
   snprintf(payload, sizeof(payload), "%lu", (unsigned long)canRxCount);
