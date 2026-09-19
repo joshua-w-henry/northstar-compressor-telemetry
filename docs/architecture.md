@@ -43,7 +43,9 @@ The CAN file records every received classical CAN frame with:
 
 The Nano file preserves every complete UART line with monotonic and wall-clock timestamps.
 
-Files are flushed once per second. Local SD logging is authoritative; Wi-Fi and MQTT are secondary and must not be required for capture.
+Files are flushed once per second. CAN records are formatted into a fixed local buffer and written to the card in one write call per frame, allowing short writes to be detected and counted. CAN monotonic timestamps use the ESP32's 64-bit microsecond timer so they do not wrap after about 71 minutes. Local SD logging is authoritative; Wi-Fi and MQTT are secondary and must not be required for capture.
+
+The ESP also publishes SD health over MQTT: mount state, card type, capacity, used/free space, session number, SPI speed, cumulative mount/write failures, bytes written, last-write age, and the most recent SD error.
 
 ## Time
 
