@@ -136,16 +136,42 @@ static bool openSessionLogs() {
 }
 
 static bool startSd() {
-  Serial.println("SD init");
+  Serial.printf("SD init @ %lu Hz\n", (unsigned long)SD_SPI_HZ);
+
+  pinMode(PIN_SD_CS, OUTPUT);
+  digitalWrite(PIN_SD_CS, HIGH);
+  delay(20);
+
   SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
 
-  if (!SD.begin(PIN_SD_CS, SPI, SD_SPI_HZ)) {
-    Serial.println("SD mount FAILED");
-    return false;
+  bool mounted = false;
+
+  for (uint8_t attempt = 1; attempt <= SD_INIT_ATTEMPTS; ++attempt) {
+    Serial.printf("SD mount attempt %u/%u\n", attempt, SD_INIT_ATTEMPTS);
+
+    if (SD.begin(PIN_SD_CS, SPI, SD_SPI_HZ)) {
+      if (SD.cardType() != CARD_NONE) {
+        mounted = true;
+        Serial.printf("SD mount OK on attempt %u\n", attempt);
+        break;
+      }
+
+      Serial.println("SD card type NONE");
+    } else {
+      Serial.println("SD.begin failed");
+    }
+
+    SD.end();
+    digitalWrite(PIN_SD_CS, HIGH);
+
+    if (attempt < SD_INIT_ATTEMPTS) {
+      delay(SD_INIT_RETRY_DELAY_MS);
+    }
   }
 
-  if (SD.cardType() == CARD_NONE) {
-    Serial.println("SD no card");
+  if (!mounted) {
+    Serial.println("SD mount FAILED after retries");
+    sdReady = false;
     return false;
   }
 
