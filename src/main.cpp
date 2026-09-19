@@ -167,10 +167,8 @@ static void publishSdHealth() {
   snprintf(payload, sizeof(payload), "%llu", (unsigned long long)sdBytesWritten);
   publishText("sd/bytes_written", payload, false);
 
-  if (now - lastSdHealthPublishMs >= SD_HEALTH_PERIOD_MS) {
-    lastSdHealthPublishMs = now;
-    publishSdHealth();
-  }
+  snprintf(payload, sizeof(payload), "%u", sessionNumber);
+  publishText("sd/session", payload, true);
 
   if (sdReady) {
     const uint64_t capacity = SD.cardSize();
@@ -702,8 +700,10 @@ static void publishSlow() {
   snprintf(payload, sizeof(payload), "%d", WiFi.RSSI());
   publishText("wifi/rssi", payload, false);
 
-  snprintf(payload, sizeof(payload), "%u", sessionNumber);
-  publishText("sd/session", payload, true);
+  if (now - lastSdHealthPublishMs >= SD_HEALTH_PERIOD_MS) {
+    lastSdHealthPublishMs = now;
+    publishSdHealth();
+  }
 }
 
 void setup() {
