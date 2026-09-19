@@ -40,10 +40,28 @@ The ESP32 parses the Nano controller's once-per-second `STATUS ...` line and pub
 - `nano/line_count`
 - `nano/status_parse_ok`
 - `nano/status_parse_error`
-- `sd/status` (retained)
+- `sd/status` (retained) — `online`, `degraded`, or `mount_failed`
+- `sd/mounted` (retained)
+- `sd/card_type` (retained)
+- `sd/capacity_mb` (retained)
+- `sd/used_mb`
+- `sd/free_mb`
+- `sd/free_percent`
 - `sd/session` (retained)
+- `sd/spi_hz` (retained)
+- `sd/write_ok`
+- `sd/write_errors`
+- `sd/bytes_written`
+- `sd/last_write_age_s`
+- `sd/mount_attempts`
+- `sd/mount_failures`
+- `sd/last_error` (retained)
 - `wifi/rssi`
 
 The Nano UART line counter is independent of SD-card health. A failed SD mount therefore does not prevent UART reception or MQTT telemetry.
 
 Raw CAN frames are intentionally not published continuously to Home Assistant. The SD card remains the authoritative raw CAN capture path.
+
+
+SD health is republished every 30 seconds. A mount or write failure remains visible through
+`sd/status`, `sd/last_error`, and the cumulative failure counters even if other telemetry continues normally.
