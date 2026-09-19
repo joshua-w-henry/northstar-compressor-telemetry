@@ -40,7 +40,7 @@ sections:
         needle: true
 
       - type: gauge
-        entity: sensor.northstar_compressor_engine_rpm
+        entity: sensor.northstar_compressor_rpm
         name: Engine RPM
         min: 0
         max: 4000
@@ -82,9 +82,9 @@ sections:
         entities:
           - entity: sensor.northstar_compressor_hobbs_hours
             name: Hobbs
-          - entity: sensor.northstar_compressor_start_cycles
+          - entity: sensor.northstar_compressor_cycles
             name: Start Cycles
-          - entity: sensor.northstar_compressor_last_event
+          - entity: sensor.northstar_compressor_event
             name: Last Event
 
   - type: grid
@@ -116,7 +116,7 @@ sections:
         hours_to_show: 2
         entities:
           - sensor.northstar_compressor_pressure_psi
-          - sensor.northstar_compressor_engine_rpm
+          - sensor.northstar_compressor_rpm
           - sensor.northstar_compressor_battery_voltage
 ```
 
@@ -126,12 +126,12 @@ The firmware publishes retained Home Assistant discovery configuration under `ho
 
 - `sensor.northstar_compressor_state`
 - `binary_sensor.northstar_compressor_running`
-- `sensor.northstar_compressor_engine_rpm`
+- `sensor.northstar_compressor_rpm`
 - `sensor.northstar_compressor_pressure_psi`
 - `sensor.northstar_compressor_battery_voltage`
 - `sensor.northstar_compressor_fault`
 - `sensor.northstar_compressor_hobbs_hours`
-- `sensor.northstar_compressor_start_cycles`
+- `sensor.northstar_compressor_cycles`
 - `binary_sensor.northstar_compressor_master`
 - `binary_sensor.northstar_compressor_start_stop`
 - `binary_sensor.northstar_compressor_unloader`
