@@ -48,6 +48,32 @@ uint32_t canLogDropCount = 0;
 uint32_t nanoLineCount = 0;
 uint16_t engineRpm = 0;
 
+struct ControllerStatus {
+  bool valid = false;
+  char mode[8] = "";
+  char state[16] = "";
+  char autoSwitch[8] = "";
+  char running[4] = "";
+  uint16_t rpm = 0;
+  float pressurePsi = 0.0f;
+  float batteryVoltage = 0.0f;
+  char pressureSwitch[8] = "";
+  char masterMonitor[8] = "";
+  uint8_t master = 0;
+  uint8_t startStop = 0;
+  uint8_t unloader = 0;
+  uint8_t idle = 0;
+  uint8_t kill = 0;
+  uint16_t startPulseMs = 0;
+  char fault[20] = "";
+  float hobbsHours = 0.0f;
+  uint32_t cycles = 0;
+};
+
+ControllerStatus controllerStatus;
+uint32_t nanoStatusParseOk = 0;
+uint32_t nanoStatusParseError = 0;
+
 unsigned long wifiAttemptStartedMs = 0;
 unsigned long wifiNextAttemptMs = 0;
 unsigned long lastMqttAttemptMs = 0;
@@ -181,7 +207,6 @@ static void logNanoLine(const char* line) {
                  (unsigned long)millis(),
                  (unsigned long long)epochMsNow(),
                  line);
-  ++nanoLineCount;
 }
 
 static bool startTwai() {
@@ -229,6 +254,106 @@ static void processCan() {
   }
 }
 
+static void publishControllerState() {
+  if (!mqtt.connected() || !controllerStatus.valid) return;
+
+  char payload[40];
+
+  publishText("mode", controllerStatus.mode, false);
+  publishText("state", controllerStatus.state, false);
+  publishText("auto_switch", controllerStatus.autoSwitch, false);
+  publishText("running", controllerStatus.running, false);
+
+  snprintf(payload, sizeof(payload), "%u", controllerStatus.rpm);
+  publishText("rpm", payload, false);
+
+  snprintf(payload, sizeof(payload), "%.1f", controllerStatus.pressurePsi);
+  publishText("pressure_psi", payload, false);
+
+  snprintf(payload, sizeof(payload), "%.2f", controllerStatus.batteryVoltage);
+  publishText("battery_voltage", payload, false);
+
+  publishText("pressure_switch", controllerStatus.pressureSwitch, false);
+  publishText("master_monitor", controllerStatus.masterMonitor, false);
+
+  snprintf(payload, sizeof(payload), "%u", controllerStatus.master);
+  publishText("master", payload, false);
+
+  snprintf(payload, sizeof(payload), "%u", controllerStatus.startStop);
+  publishText("start_stop", payload, false);
+
+  snprintf(payload, sizeof(payload), "%u", controllerStatus.unloader);
+  publishText("unloader", payload, false);
+
+  snprintf(payload, sizeof(payload), "%u", controllerStatus.idle);
+  publishText("idle", payload, false);
+
+  snprintf(payload, sizeof(payload), "%u", controllerStatus.kill);
+  publishText("kill", payload, false);
+
+  snprintf(payload, sizeof(payload), "%u", controllerStatus.startPulseMs);
+  publishText("start_pulse_ms", payload, false);
+
+  publishText("fault", controllerStatus.fault, false);
+
+  snprintf(payload, sizeof(payload), "%.2f", controllerStatus.hobbsHours);
+  publishText("hobbs_hours", payload, false);
+
+  snprintf(payload, sizeof(payload), "%lu", (unsigned long)controllerStatus.cycles);
+  publishText("cycles", payload, false);
+}
+
+static bool parseControllerStatus(const char* line) {
+  if (strncmp(line, "STATUS ", 7) != 0) return false;
+
+  ControllerStatus parsed;
+
+  const int matched = sscanf(
+      line,
+      "STATUS mode=%7s state=%15s sw=%7s run=%3s rpm=%hu psi=%f V=%f p=%7s mon=%7s | M=%hhu S=%hhu U=%hhu I=%hhu K=%hhu pulse=%hu fault=%19s hrs=%f cyc=%lu",
+      parsed.mode,
+      parsed.state,
+      parsed.autoSwitch,
+      parsed.running,
+      &parsed.rpm,
+      &parsed.pressurePsi,
+      &parsed.batteryVoltage,
+      parsed.pressureSwitch,
+      parsed.masterMonitor,
+      &parsed.master,
+      &parsed.startStop,
+      &parsed.unloader,
+      &parsed.idle,
+      &parsed.kill,
+      &parsed.startPulseMs,
+      parsed.fault,
+      &parsed.hobbsHours,
+      &parsed.cycles);
+
+  if (matched != 18) {
+    ++nanoStatusParseError;
+    return false;
+  }
+
+  parsed.valid = true;
+  controllerStatus = parsed;
+  ++nanoStatusParseOk;
+  publishControllerState();
+  return true;
+}
+
+static void processNanoLine(const char* line) {
+  ++nanoLineCount;
+
+  if (parseControllerStatus(line)) return;
+
+  if (strncmp(line, "EV ", 3) == 0) {
+    publishText("event", line + 3, false);
+  } else if (!strcmp(line, "MANUAL") || !strcmp(line, "AUTO")) {
+    publishText("controller_message", line, false);
+  }
+}
+
 static void processNanoUart() {
   static char line[192];
   static size_t len = 0;
@@ -241,6 +366,7 @@ static void processNanoUart() {
       line[len] = 0;
       if (len) {
         Serial.printf("NANO %s\n", line);
+        processNanoLine(line);
         logNanoLine(line);
       }
       len = 0;
@@ -329,6 +455,7 @@ static void connectMqtt() {
     mqtt.publish(availability.c_str(), "online", true);
     publishText("sd/status", sdReady ? "online" : "fault", true);
     publishText("can/status", twaiReady ? "listen_only" : "fault", true);
+    publishControllerState();
     Serial.println("MQTT OK");
   }
 }
@@ -353,7 +480,8 @@ static void publishFast() {
   if (!mqtt.connected()) return;
 
   char payload[24];
-  snprintf(payload, sizeof(payload), "%u", engineRpm);
+  const uint16_t rpm = controllerStatus.valid ? controllerStatus.rpm : engineRpm;
+  snprintf(payload, sizeof(payload), "%u", rpm);
   publishText("rpm", payload, false);
 }
 
@@ -376,6 +504,12 @@ static void publishSlow() {
 
   snprintf(payload, sizeof(payload), "%lu", (unsigned long)nanoLineCount);
   publishText("nano/line_count", payload, false);
+
+  snprintf(payload, sizeof(payload), "%lu", (unsigned long)nanoStatusParseOk);
+  publishText("nano/status_parse_ok", payload, false);
+
+  snprintf(payload, sizeof(payload), "%lu", (unsigned long)nanoStatusParseError);
+  publishText("nano/status_parse_error", payload, false);
 
   snprintf(payload, sizeof(payload), "%d", WiFi.RSSI());
   publishText("wifi/rssi", payload, false);
