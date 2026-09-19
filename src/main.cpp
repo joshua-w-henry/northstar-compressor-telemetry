@@ -624,6 +624,118 @@ static void serviceWifi() {
   }
 }
 
+static void publishHaDiscoveryEntity(const char* component,
+                                     const char* objectId,
+                                     const char* name,
+                                     const char* stateSuffix,
+                                     const char* extraJson = "") {
+  if (!mqtt.connected()) return;
+
+  char topic[160];
+  char payload[900];
+
+  snprintf(topic, sizeof(topic),
+           "homeassistant/%s/northstar_compressor/%s/config",
+           component, objectId);
+
+  snprintf(payload, sizeof(payload),
+           "{\"name\":\"%s\","
+           "\"unique_id\":\"northstar_compressor_%s\","
+           "\"object_id\":\"northstar_compressor_%s\","
+           "\"state_topic\":\"%s/%s\","
+           "\"availability_topic\":\"%s/availability\","
+           "\"device\":{"
+             "\"identifiers\":[\"northstar_compressor\"],"
+             "\"name\":\"NorthStar Compressor\","
+             "\"manufacturer\":\"Wayne\","
+             "\"model\":\"Nano + ESP32-S3\""
+           "}%s}",
+           name,
+           objectId,
+           objectId,
+           MQTT_BASE_TOPIC,
+           stateSuffix,
+           MQTT_BASE_TOPIC,
+           extraJson);
+
+  if (!mqtt.publish(topic, payload, true)) {
+    Serial.printf("HA discovery publish failed: %s\n", objectId);
+  }
+}
+
+static void publishHaDiscovery() {
+  Serial.println("HA discovery publish");
+
+  publishHaDiscoveryEntity("sensor", "state", "State", "state");
+  publishHaDiscoveryEntity("sensor", "mode", "Mode", "mode");
+  publishHaDiscoveryEntity("sensor", "auto_switch", "Auto Switch", "auto_switch");
+  publishHaDiscoveryEntity("sensor", "pressure_switch", "Pressure Switch", "pressure_switch");
+  publishHaDiscoveryEntity("sensor", "fault", "Fault", "fault");
+  publishHaDiscoveryEntity("sensor", "event", "Last Event", "event");
+
+  publishHaDiscoveryEntity(
+      "sensor", "rpm", "Engine RPM", "rpm",
+      ",\"unit_of_measurement\":\"rpm\",\"state_class\":\"measurement\"");
+
+  publishHaDiscoveryEntity(
+      "sensor", "pressure_psi", "Tank Pressure", "pressure_psi",
+      ",\"device_class\":\"pressure\",\"unit_of_measurement\":\"psi\",\"state_class\":\"measurement\"");
+
+  publishHaDiscoveryEntity(
+      "sensor", "battery_voltage", "Battery Voltage", "battery_voltage",
+      ",\"device_class\":\"voltage\",\"unit_of_measurement\":\"V\",\"state_class\":\"measurement\"");
+
+  publishHaDiscoveryEntity(
+      "sensor", "hobbs_hours", "Hobbs Hours", "hobbs_hours",
+      ",\"unit_of_measurement\":\"h\",\"state_class\":\"total_increasing\"");
+
+  publishHaDiscoveryEntity(
+      "sensor", "cycles", "Start Cycles", "cycles",
+      ",\"state_class\":\"total_increasing\"");
+
+  publishHaDiscoveryEntity(
+      "sensor", "wifi_rssi", "Wi-Fi RSSI", "wifi/rssi",
+      ",\"device_class\":\"signal_strength\",\"unit_of_measurement\":\"dBm\",\"entity_category\":\"diagnostic\"");
+
+  publishHaDiscoveryEntity(
+      "sensor", "sd_status", "SD Status", "sd/status",
+      ",\"entity_category\":\"diagnostic\"");
+  publishHaDiscoveryEntity(
+      "sensor", "sd_session", "SD Session", "sd/session",
+      ",\"entity_category\":\"diagnostic\"");
+  publishHaDiscoveryEntity(
+      "sensor", "can_rx_count", "CAN RX Count", "can/rx_count",
+      ",\"state_class\":\"total_increasing\",\"entity_category\":\"diagnostic\"");
+  publishHaDiscoveryEntity(
+      "sensor", "can_error_count", "CAN Error Count", "can/error_count",
+      ",\"state_class\":\"total_increasing\",\"entity_category\":\"diagnostic\"");
+  publishHaDiscoveryEntity(
+      "sensor", "nano_line_count", "Nano UART Lines", "nano/line_count",
+      ",\"state_class\":\"total_increasing\",\"entity_category\":\"diagnostic\"");
+
+  publishHaDiscoveryEntity(
+      "binary_sensor", "running", "Engine Running", "running",
+      ",\"payload_on\":\"Y\",\"payload_off\":\"N\",\"device_class\":\"running\"");
+  publishHaDiscoveryEntity(
+      "binary_sensor", "master", "Master Output", "master",
+      ",\"payload_on\":\"1\",\"payload_off\":\"0\"");
+  publishHaDiscoveryEntity(
+      "binary_sensor", "start_stop", "Start Stop Output", "start_stop",
+      ",\"payload_on\":\"1\",\"payload_off\":\"0\"");
+  publishHaDiscoveryEntity(
+      "binary_sensor", "unloader", "Unloader", "unloader",
+      ",\"payload_on\":\"1\",\"payload_off\":\"0\"");
+  publishHaDiscoveryEntity(
+      "binary_sensor", "idle", "Idle", "idle",
+      ",\"payload_on\":\"1\",\"payload_off\":\"0\"");
+  publishHaDiscoveryEntity(
+      "binary_sensor", "kill", "Kill", "kill",
+      ",\"payload_on\":\"1\",\"payload_off\":\"0\"");
+  publishHaDiscoveryEntity(
+      "binary_sensor", "sd_mounted", "SD Mounted", "sd/mounted",
+      ",\"payload_on\":\"true\",\"payload_off\":\"false\",\"entity_category\":\"diagnostic\"");
+}
+
 static void connectMqtt() {
   if (mqtt.connected() || WiFi.status() != WL_CONNECTED) return;
 
@@ -638,6 +750,7 @@ static void connectMqtt() {
                    true,
                    "offline")) {
     mqtt.publish(availability.c_str(), "online", true);
+    publishHaDiscovery();
     publishSdHealth();
     publishText("can/status", twaiReady ? "listen_only" : "fault", true);
     publishControllerState();
@@ -715,6 +828,7 @@ void setup() {
   WiFi.mode(WIFI_STA);
 
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setBufferSize(1024);
   mqtt.setSocketTimeout(1);
   mqtt.setKeepAlive(30);
 
