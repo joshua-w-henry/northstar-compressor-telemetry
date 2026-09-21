@@ -31,7 +31,28 @@ The ESP32 must never be required for safe compressor operation.
 5. SD raw CAN logging
 6. Nano UART telemetry ingest
 7. Home Assistant MQTT discovery
-8. Idle-time log upload to UNICORN
+8. Manual read-only SD log pull over local HTTP
+
+## SD log file pull
+
+When the ESP32-S3 is connected to Wi-Fi, it exposes a small **read-only**
+HTTP server for manual retrieval of SD logs.
+
+Open:
+
+```text
+http://<ESP32-IP>/
+```
+
+The index page lists the generated `can_####.csv` and `nano_####.log`
+files and provides download links. The server exposes no upload, edit, or
+delete functions.
+
+The active log files are flushed immediately before a download begins, so the
+download is consistent up to that instant. A file transfer temporarily occupies
+the ESP32 telemetry loop, so large downloads are best done while the compressor
+is idle. The Nano remains the authoritative controller and is unaffected by an
+ESP32 file transfer.
 
 ## Safety boundary
 
