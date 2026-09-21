@@ -94,6 +94,7 @@ unsigned long lastFastPublishMs = 0;
 unsigned long lastSlowPublishMs = 0;
 unsigned long lastSdFlushMs = 0;
 unsigned long lastSdHealthPublishMs = 0;
+unsigned long lastSdHotplugProbeMs = 0;
 
 static uint64_t epochMsNow() {
   struct timeval tv;
@@ -206,6 +207,8 @@ static void publishSdHealth() {
 static bool openSessionLogs() {
   if (!sdReady) return false;
 
+  sessionNumber = 0;
+
   char canPath[24];
   char nanoPath[24];
 
@@ -252,7 +255,7 @@ static bool openSessionLogs() {
   return true;
 }
 
-static bool startSd() {
+static bool startSd(uint8_t attempts = SD_INIT_ATTEMPTS) {
   Serial.printf("SD init @ %lu Hz\n", (unsigned long)SD_SPI_HZ);
 
   pinMode(PIN_SD_CS, OUTPUT);
@@ -263,9 +266,9 @@ static bool startSd() {
 
   bool mounted = false;
 
-  for (uint8_t attempt = 1; attempt <= SD_INIT_ATTEMPTS; ++attempt) {
+  for (uint8_t attempt = 1; attempt <= attempts; ++attempt) {
     ++sdMountAttempts;
-    Serial.printf("SD mount attempt %u/%u\n", attempt, SD_INIT_ATTEMPTS);
+    Serial.printf("SD mount attempt %u/%u\n", attempt, attempts);
 
     if (SD.begin(PIN_SD_CS, SPI, SD_SPI_HZ)) {
       if (SD.cardType() != CARD_NONE) {
@@ -285,7 +288,7 @@ static bool startSd() {
     SD.end();
     digitalWrite(PIN_SD_CS, HIGH);
 
-    if (attempt < SD_INIT_ATTEMPTS) {
+    if (attempt < attempts) {
       delay(SD_INIT_RETRY_DELAY_MS);
     }
   }
@@ -305,10 +308,29 @@ static bool startSd() {
   sdLastError[sizeof(sdLastError) - 1] = 0;
   if (!openSessionLogs()) {
     sdReady = false;
+    SD.end();
+    digitalWrite(PIN_SD_CS, HIGH);
     return false;
   }
 
   return true;
+}
+
+static void serviceSdHotplug() {
+  if (sdReady) return;
+
+  const unsigned long now = millis();
+  if (now - lastSdHotplugProbeMs < SD_HOTPLUG_POLL_MS) return;
+  lastSdHotplugProbeMs = now;
+
+  Serial.println("SD hotplug probe");
+
+  // A single non-blocking-ish mount attempt is enough here. If the card is
+  // still absent, the next probe happens later without tying up telemetry.
+  if (startSd(1)) {
+    Serial.printf("SD hotplug detected; session %04u started\n", sessionNumber);
+    publishSdHealth();
+  }
 }
 
 static void flushLogsIfDue() {
@@ -906,6 +928,9 @@ static void publishHaDiscovery() {
   publishHaDiscoveryEntity(
       "sensor", "wifi_rssi", "Wi-Fi RSSI", "wifi/rssi",
       ",\"device_class\":\"signal_strength\",\"unit_of_measurement\":\"dBm\",\"entity_category\":\"diagnostic\"");
+  publishHaDiscoveryEntity(
+      "sensor", "wifi_ip", "IP Address", "wifi/ip",
+      ",\"entity_category\":\"diagnostic\",\"icon\":\"mdi:ip-network\"");
 
   publishHaDiscoveryEntity(
       "sensor", "sd_status", "SD Status", "sd/status",
@@ -961,6 +986,8 @@ static void connectMqtt() {
                    "offline")) {
     mqtt.publish(availability.c_str(), "online", true);
     publishHaDiscovery();
+    const String ipAddress = WiFi.localIP().toString();
+    publishText("wifi/ip", ipAddress.c_str(), true);
     publishSdHealth();
     publishText("can/status", twaiReady ? "listen_only" : "fault", true);
     publishControllerState();
@@ -1054,6 +1081,7 @@ void setup() {
 void loop() {
   processCan();
   processNanoUart();
+  serviceSdHotplug();
   flushLogsIfDue();
 
   serviceWifi();
