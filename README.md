@@ -8,7 +8,7 @@ The Nano remains the authoritative controller. The ESP32-S3 is an observer/logge
 
 - Nano: control, safety, local OLED, FRAM counters, faults
 - ESP32-S3: passive CAN capture, SD logging, Nano UART ingest, Wi-Fi/MQTT
-- Home Assistant: live telemetry, alerts, maintenance reminders, history
+- Home Assistant: live telemetry, alerts, maintenance reminders, history, and diagnostic IP address
 - UNICORN: long-term raw CAN archive
 
 The ESP32 must never be required for safe compressor operation.
@@ -47,6 +47,10 @@ http://<ESP32-IP>/
 The index page lists the generated `can_####.csv` and `nano_####.log`
 files and provides download links. The server exposes no upload, edit, or
 delete functions.
+
+If the ESP32 boots without a card installed, it checks again every 5 seconds.
+Inserting the card later automatically mounts it and starts a new logging session;
+a reboot is not required.
 
 The active log files are flushed immediately before a download begins, so the
 download is consistent up to that instant. A file transfer temporarily occupies
