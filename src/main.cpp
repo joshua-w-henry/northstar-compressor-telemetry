@@ -59,6 +59,7 @@ uint32_t sdWriteErrors = 0;
 uint64_t sdBytesWritten = 0;
 unsigned long sdLastWriteMs = 0;
 bool sdLastWriteOk = false;
+bool sdMediaFaultPending = false;
 char sdLastError[48] = "not_initialized";
 
 struct ControllerStatus {
@@ -139,6 +140,7 @@ static void noteSdWrite(size_t expected, size_t actual, const char* context) {
 
   ++sdWriteErrors;
   sdLastWriteOk = false;
+  sdMediaFaultPending = true;
   snprintf(sdLastError, sizeof(sdLastError), "%s_short_write", context);
 }
 
@@ -303,6 +305,7 @@ static bool startSd(uint8_t attempts = SD_INIT_ATTEMPTS) {
                 (unsigned long long)(SD.cardSize() / (1024ULL * 1024ULL)));
 
   sdReady = true;
+  sdMediaFaultPending = false;
   sdLastWriteOk = true;
   strncpy(sdLastError, "none", sizeof(sdLastError) - 1);
   sdLastError[sizeof(sdLastError) - 1] = 0;
@@ -317,6 +320,25 @@ static bool startSd(uint8_t attempts = SD_INIT_ATTEMPTS) {
 }
 
 static void serviceSdHotplug() {
+  // A failed write is treated as media loss. Close stale handles and return to
+  // the periodic mount probe so removal/reinsertion can recover without reboot.
+  if (sdReady && sdMediaFaultPending) {
+    Serial.println("SD media/write fault; closing logs and waiting for remount");
+
+    if (canLog) canLog.close();
+    if (nanoLog) nanoLog.close();
+
+    SD.end();
+    digitalWrite(PIN_SD_CS, HIGH);
+
+    sdReady = false;
+    sessionNumber = 0;
+    sdMediaFaultPending = false;
+    setSdError("media_lost");
+
+    publishSdHealth();
+  }
+
   if (sdReady) return;
 
   const unsigned long now = millis();
@@ -325,8 +347,8 @@ static void serviceSdHotplug() {
 
   Serial.println("SD hotplug probe");
 
-  // A single non-blocking-ish mount attempt is enough here. If the card is
-  // still absent, the next probe happens later without tying up telemetry.
+  // A single mount attempt is enough here. If the card is still absent, the
+  // next probe happens later without tying up telemetry.
   if (startSd(1)) {
     Serial.printf("SD hotplug detected; session %04u started\n", sessionNumber);
     publishSdHealth();
