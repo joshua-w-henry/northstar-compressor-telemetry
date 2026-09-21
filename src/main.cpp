@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include <PubSubClient.h>
 #include <driver/twai.h>
 #include <SPI.h>
@@ -29,6 +30,9 @@
 HardwareSerial NanoSerial(1);
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
+WebServer sdServer(SD_HTTP_PORT);
+bool sdServerRoutesConfigured = false;
+bool sdServerStarted = false;
 
 File canLog;
 File nanoLog;
@@ -563,6 +567,209 @@ static void processNanoUart() {
   }
 }
 
+
+static String normalizeSdPath(String path) {
+  path.trim();
+  if (!path.startsWith("/")) path = "/" + path;
+  return path;
+}
+
+static bool isDownloadableLogPath(const String& path) {
+  if (!path.startsWith("/")) return false;
+  if (path.indexOf("..") >= 0) return false;
+  if (path.indexOf('/', 1) >= 0) return false;
+
+  return (path.startsWith("/can_") && path.endsWith(".csv")) ||
+         (path.startsWith("/nano_") && path.endsWith(".log"));
+}
+
+static String urlEncode(const String& input) {
+  static const char hex[] = "0123456789ABCDEF";
+  String out;
+  out.reserve(input.length() * 3);
+
+  for (size_t i = 0; i < input.length(); ++i) {
+    const uint8_t c = (uint8_t)input[i];
+
+    if ((c >= 'a' && c <= 'z') ||
+        (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') ||
+        c == '-' || c == '_' || c == '.' || c == '~') {
+      out += (char)c;
+    } else {
+      out += '%';
+      out += hex[(c >> 4) & 0x0F];
+      out += hex[c & 0x0F];
+    }
+  }
+
+  return out;
+}
+
+static void flushLogsNow() {
+  if (canLog) canLog.flush();
+  if (nanoLog) nanoLog.flush();
+}
+
+static void handleSdIndex() {
+  if (!sdReady) {
+    sdServer.send(503, "text/plain",
+                  "SD card is not available. Check Home Assistant SD diagnostics.\n");
+    return;
+  }
+
+  String html;
+  html.reserve(4096);
+  html += F("<!doctype html><html><head><meta name=\"viewport\" "
+            "content=\"width=device-width,initial-scale=1\">"
+            "<title>NorthStar SD Logs</title></head><body>"
+            "<h2>NorthStar Compressor SD Logs</h2>"
+            "<p>Read-only file pull. No upload or delete functions are exposed.</p>"
+            "<p><strong>Best practice:</strong> download while the compressor is idle. "
+            "A large transfer temporarily occupies the ESP32 telemetry loop; "
+            "the Nano controller is unaffected.</p><ul>");
+
+  File root = SD.open("/");
+  if (!root || !root.isDirectory()) {
+    if (root) root.close();
+    sdServer.send(500, "text/plain", "Could not open SD root directory.\n");
+    return;
+  }
+
+  bool found = false;
+  File entry = root.openNextFile();
+
+  while (entry) {
+    if (!entry.isDirectory()) {
+      String path = entry.name();
+      if (!path.startsWith("/")) path = "/" + path;
+
+      if (isDownloadableLogPath(path)) {
+        found = true;
+        char sizeText[32];
+        snprintf(sizeText, sizeof(sizeText), "%llu",
+                 (unsigned long long)entry.size());
+
+        html += F("<li><a href=\"/download?file=");
+        html += urlEncode(path);
+        html += F("\">");
+        html += path.substring(1);
+        html += F("</a> &mdash; ");
+        html += sizeText;
+        html += F(" bytes</li>");
+      }
+    }
+
+    entry.close();
+    entry = root.openNextFile();
+  }
+
+  root.close();
+
+  if (!found) {
+    html += F("<li>No CAN/Nano log files found.</li>");
+  }
+
+  html += F("</ul><p><a href=\"/health\">SD server health</a></p></body></html>");
+  sdServer.send(200, "text/html", html);
+}
+
+static void handleSdDownload() {
+  if (!sdReady) {
+    sdServer.send(503, "text/plain", "SD card is not available.\n");
+    return;
+  }
+
+  if (!sdServer.hasArg("file")) {
+    sdServer.send(400, "text/plain", "Missing file query parameter.\n");
+    return;
+  }
+
+  const String path = normalizeSdPath(sdServer.arg("file"));
+  if (!isDownloadableLogPath(path)) {
+    sdServer.send(400, "text/plain", "Only root CAN CSV and Nano LOG files may be downloaded.\n");
+    return;
+  }
+
+  // Make the active session consistent up to this instant before opening a
+  // second read handle. loop() is blocked during streamFile(), so no new SD
+  // writes occur until the transfer completes.
+  flushLogsNow();
+
+  File file = SD.open(path.c_str(), FILE_READ);
+  if (!file || file.isDirectory()) {
+    if (file) file.close();
+    sdServer.send(404, "text/plain", "File not found.\n");
+    return;
+  }
+
+  String filename = path.substring(1);
+  sdServer.sendHeader("Content-Disposition",
+                      "attachment; filename=\"" + filename + "\"");
+  sdServer.sendHeader("Cache-Control", "no-store");
+  sdServer.sendHeader("Connection", "close");
+
+  const char* contentType = path.endsWith(".csv")
+                                ? "text/csv"
+                                : "text/plain";
+
+  Serial.printf("SD HTTP download start: %s (%llu bytes)\n",
+                path.c_str(),
+                (unsigned long long)file.size());
+
+  sdServer.streamFile(file, contentType);
+  file.close();
+
+  Serial.printf("SD HTTP download complete: %s\n", path.c_str());
+}
+
+static void handleSdHealth() {
+  char body[256];
+
+  snprintf(body, sizeof(body),
+           "northstar_sd_server=ok\n"
+           "sd_mounted=%s\n"
+           "session=%u\n"
+           "ip=%s\n"
+           "port=%u\n",
+           sdReady ? "true" : "false",
+           sessionNumber,
+           WiFi.localIP().toString().c_str(),
+           (unsigned)SD_HTTP_PORT);
+
+  sdServer.send(sdReady ? 200 : 503, "text/plain", body);
+}
+
+static void startSdFileServer() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  if (!sdServerRoutesConfigured) {
+    sdServer.on("/", HTTP_GET, handleSdIndex);
+    sdServer.on("/download", HTTP_GET, handleSdDownload);
+    sdServer.on("/health", HTTP_GET, handleSdHealth);
+    sdServer.onNotFound([]() {
+      sdServer.send(404, "text/plain",
+                    "Not found. Open / for the NorthStar SD log index.\n");
+    });
+
+    sdServerRoutesConfigured = true;
+  }
+
+  // Calling begin again after a Wi-Fi reconnect is harmless and ensures the
+  // listener is attached to the current network interface.
+  sdServer.begin();
+  sdServerStarted = true;
+
+  Serial.printf("SD HTTP server ready: http://%s:%u/\n",
+                WiFi.localIP().toString().c_str(),
+                (unsigned)SD_HTTP_PORT);
+}
+
+static void serviceSdFileServer() {
+  if (!sdServerStarted || WiFi.status() != WL_CONNECTED) return;
+  sdServer.handleClient();
+}
+
 static void beginWifiAttempt(uint8_t index) {
   const char* ssids[] = {WIFI_SSID_1, WIFI_SSID_2};
   const char* passes[] = {WIFI_PASS_1, WIFI_PASS_2};
@@ -595,6 +802,8 @@ static void serviceWifi() {
                     WiFi.localIP().toString().c_str(),
                     WiFi.RSSI());
 
+      startSdFileServer();
+
       if (!ntpStarted) {
         configTime(0, 0, "pool.ntp.org", "time.google.com");
         ntpStarted = true;
@@ -606,6 +815,7 @@ static void serviceWifi() {
 
   if (wifiWasConnected) {
     wifiWasConnected = false;
+    sdServerStarted = false;
     Serial.println("WIFI lost");
   }
 
@@ -847,6 +1057,7 @@ void loop() {
   flushLogsIfDue();
 
   serviceWifi();
+  serviceSdFileServer();
   serviceMqtt();
 
   const unsigned long now = millis();
