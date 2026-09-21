@@ -17,6 +17,7 @@ constexpr uint8_t SD_INIT_ATTEMPTS = 3;
 constexpr uint32_t SD_INIT_RETRY_DELAY_MS = 300;
 constexpr uint32_t SD_FLUSH_PERIOD_MS = 1000;
 constexpr uint32_t SD_HEALTH_PERIOD_MS = 30000;
+constexpr uint32_t SD_HOTPLUG_POLL_MS = 5000;
 constexpr uint16_t SD_HTTP_PORT = 80;
 
 constexpr uint32_t RPM_CAN_ID = 0x0C665500UL;
