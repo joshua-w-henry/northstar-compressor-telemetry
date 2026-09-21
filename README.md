@@ -50,7 +50,9 @@ delete functions.
 
 If the ESP32 boots without a card installed, it checks again every 5 seconds.
 Inserting the card later automatically mounts it and starts a new logging session;
-a reboot is not required.
+a reboot is not required. If an active card is removed and a subsequent log write
+fails, the firmware drops the stale file handles and returns to the same remount
+loop so reinsertion can recover automatically.
 
 The active log files are flushed immediately before a download begins, so the
 download is consistent up to that instant. A file transfer temporarily occupies
