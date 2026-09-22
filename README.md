@@ -21,8 +21,13 @@ The ESP32 must never be required for safe compressor operation.
 - microSD SPI module
 - dedicated 5 V buck supply
 - Nano TX -> divider -> ESP32 UART RX
-- ESP32 GPIO 8 / TX -> 1 kΩ -> removable jumper -> Nano D0 / RX
+- ESP32 GPIO 8 / TX -> 220 Ω -> removable jumper -> Nano D0 / RX
 - existing compressor CAN H/L connection
+
+The 220 Ω return-path resistor is field-proven. A 1 kΩ resistor was initially
+tested but did not allow the ESP32 to pull Nano RX0 low enough because the Nano
+onboard USB-serial interface also biases RX0. The measured RX node was about
+4.2 V with 1 kΩ; changing to 220 Ω restored reliable UART control.
 
 ## Phase 1
 
