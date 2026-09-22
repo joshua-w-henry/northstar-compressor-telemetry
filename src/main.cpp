@@ -8,6 +8,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <esp_timer.h>
+#include <ctype.h>
 
 #include "config.h"
 #include "pins.h"
