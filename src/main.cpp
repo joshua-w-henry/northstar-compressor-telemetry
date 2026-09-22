@@ -67,6 +67,8 @@ struct ControllerStatus {
   char mode[8] = "";
   char state[16] = "";
   char autoSwitch[8] = "";
+  char remoteAuto[8] = "UNK";
+  char effectiveAuto[8] = "UNK";
   char running[4] = "";
   uint16_t rpm = 0;
   float pressurePsi = 0.0f;
@@ -495,6 +497,12 @@ static void publishControllerState() {
   publishText("mode", controllerStatus.mode, false);
   publishText("state", controllerStatus.state, false);
   publishText("auto_switch", controllerStatus.autoSwitch, false);
+  if (strcmp(controllerStatus.remoteAuto, "UNK")) {
+    publishText("remote_auto/state", controllerStatus.remoteAuto, true);
+  }
+  if (strcmp(controllerStatus.effectiveAuto, "UNK")) {
+    publishText("effective_auto", controllerStatus.effectiveAuto, false);
+  }
   publishText("running", controllerStatus.running, false);
 
   snprintf(payload, sizeof(payload), "%u", controllerStatus.rpm);
@@ -568,6 +576,20 @@ static bool parseControllerStatus(const char* line) {
     return false;
   }
 
+  // Newer Nano firmware appends permission state after the legacy status
+  // fields. Keeping it appended preserves compatibility with the original
+  // 18-field parser while allowing the sidecar to expose remote/effective AUTO.
+  const char* remotePos = strstr(line, " rmt=");
+  if (remotePos) {
+    if (sscanf(remotePos, " rmt=%7s eff=%7s",
+               parsed.remoteAuto, parsed.effectiveAuto) != 2) {
+      strncpy(parsed.remoteAuto, "UNK", sizeof(parsed.remoteAuto) - 1);
+      parsed.remoteAuto[sizeof(parsed.remoteAuto) - 1] = 0;
+      strncpy(parsed.effectiveAuto, "UNK", sizeof(parsed.effectiveAuto) - 1);
+      parsed.effectiveAuto[sizeof(parsed.effectiveAuto) - 1] = 0;
+    }
+  }
+
   parsed.valid = true;
   controllerStatus = parsed;
   ++nanoStatusParseOk;
@@ -582,6 +604,14 @@ static void processNanoLine(const char* line) {
 
   if (strncmp(line, "EV ", 3) == 0) {
     publishText("event", line + 3, false);
+
+    // Acknowledge remote AUTO changes immediately; the next STATUS line is
+    // still authoritative and will refresh both remote and effective state.
+    if (strstr(line, "EV REMOTE AUTO ON") == line) {
+      publishText("remote_auto/state", "ON", true);
+    } else if (strstr(line, "EV REMOTE AUTO OFF") == line) {
+      publishText("remote_auto/state", "OFF", true);
+    }
   } else if (!strcmp(line, "MANUAL") || !strcmp(line, "AUTO")) {
     publishText("controller_message", line, false);
   }
@@ -954,6 +984,20 @@ static void publishHaDiscovery() {
       "sensor", "wifi_ip", "IP Address", "wifi/ip",
       ",\"entity_category\":\"diagnostic\",\"icon\":\"mdi:ip-network\"");
 
+  char remoteAutoExtra[256];
+  snprintf(remoteAutoExtra, sizeof(remoteAutoExtra),
+           ",\"command_topic\":\"%s/remote_auto/set\","
+           "\"payload_on\":\"ON\",\"payload_off\":\"OFF\","
+           "\"icon\":\"mdi:engine-outline\"",
+           MQTT_BASE_TOPIC);
+  publishHaDiscoveryEntity(
+      "switch", "remote_auto", "Remote Auto", "remote_auto/state",
+      remoteAutoExtra);
+
+  publishHaDiscoveryEntity(
+      "sensor", "effective_auto", "Effective Auto", "effective_auto",
+      ",\"entity_category\":\"diagnostic\",\"icon\":\"mdi:state-machine\"");
+
   publishHaDiscoveryEntity(
       "sensor", "sd_status", "SD Status", "sd/status",
       ",\"entity_category\":\"diagnostic\"");
@@ -993,6 +1037,32 @@ static void publishHaDiscovery() {
       ",\"payload_on\":\"true\",\"payload_off\":\"false\",\"entity_category\":\"diagnostic\"");
 }
 
+static void sendNanoCommand(const char* command) {
+  NanoSerial.print(command);
+  NanoSerial.print('\n');
+  Serial.printf("NANO TX %s\n", command);
+}
+
+static void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
+  const String commandTopic = String(MQTT_BASE_TOPIC) + "/remote_auto/set";
+  if (strcmp(topic, commandTopic.c_str())) return;
+
+  char value[12];
+  const unsigned int n = length < sizeof(value) - 1 ? length : sizeof(value) - 1;
+  for (unsigned int i = 0; i < n; ++i) {
+    value[i] = (char)toupper((unsigned char)payload[i]);
+  }
+  value[n] = 0;
+
+  if (!strcmp(value, "ON")) {
+    sendNanoCommand("remote auto on");
+  } else if (!strcmp(value, "OFF")) {
+    sendNanoCommand("remote auto off");
+  } else {
+    Serial.printf("MQTT remote_auto ignored payload: %s\n", value);
+  }
+}
+
 static void connectMqtt() {
   if (mqtt.connected() || WiFi.status() != WL_CONNECTED) return;
 
@@ -1007,6 +1077,11 @@ static void connectMqtt() {
                    true,
                    "offline")) {
     mqtt.publish(availability.c_str(), "online", true);
+
+    const String remoteAutoCommandTopic =
+        String(MQTT_BASE_TOPIC) + "/remote_auto/set";
+    mqtt.subscribe(remoteAutoCommandTopic.c_str());
+
     publishHaDiscovery();
     const String ipAddress = WiFi.localIP().toString();
     publishText("wifi/ip", ipAddress.c_str(), true);
@@ -1087,11 +1162,12 @@ void setup() {
   WiFi.mode(WIFI_STA);
 
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(handleMqttMessage);
   mqtt.setBufferSize(1024);
   mqtt.setSocketTimeout(1);
   mqtt.setKeepAlive(30);
 
-  NanoSerial.begin(NANO_SERIAL_BAUD, SERIAL_8N1, PIN_NANO_RX, -1);
+  NanoSerial.begin(NANO_SERIAL_BAUD, SERIAL_8N1, PIN_NANO_RX, PIN_NANO_TX);
 
   twaiReady = startTwai();
   startSd();
