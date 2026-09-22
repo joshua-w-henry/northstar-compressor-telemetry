@@ -4,10 +4,11 @@ ESP32-S3 sidecar for the NorthStar compressor controller.
 
 ## Architecture
 
-The Nano remains the authoritative controller. The ESP32-S3 is an observer/logger/gateway only.
+The Nano remains the authoritative controller. The ESP32-S3 is primarily an
+observer/logger/gateway, with one deliberately narrow permission control.
 
 - Nano: control, safety, local OLED, FRAM counters, faults
-- ESP32-S3: passive CAN capture, SD logging, Nano UART ingest, Wi-Fi/MQTT
+- ESP32-S3: passive CAN capture, SD logging, Nano UART ingest, Wi-Fi/MQTT, remote AUTO permit gateway
 - Home Assistant: live telemetry, alerts, maintenance reminders, history, and diagnostic IP address
 - UNICORN: long-term raw CAN archive
 
@@ -19,7 +20,8 @@ The ESP32 must never be required for safe compressor operation.
 - Waveshare SN65HVD230 3.3 V CAN transceiver
 - microSD SPI module
 - dedicated 5 V buck supply
-- one-way Nano TX -> divider -> ESP32 UART RX
+- Nano TX -> divider -> ESP32 UART RX
+- ESP32 GPIO 8 / TX -> 1 kΩ -> removable jumper -> Nano D0 / RX
 - existing compressor CAN H/L connection
 
 ## Phase 1
@@ -32,6 +34,7 @@ The ESP32 must never be required for safe compressor operation.
 6. Nano UART telemetry ingest
 7. Home Assistant MQTT discovery
 8. Manual read-only SD log pull over local HTTP
+9. Limited Home Assistant remote AUTO permit ON/OFF
 
 ## SD log file pull
 
@@ -60,6 +63,31 @@ the ESP32 telemetry loop, so large downloads are best done while the compressor
 is idle. The Nano remains the authoritative controller and is unaffected by an
 ESP32 file transfer.
 
+## Limited remote AUTO control
+
+Home Assistant exposes a single `Remote Auto` switch. Its MQTT command topic is:
+
+```text
+wayne/compressor/remote_auto/set
+```
+
+Accepted payloads are `ON` and `OFF`. The ESP32 translates only those values
+into the Nano serial commands `remote auto on` and `remote auto off`.
+
+The Nano reports both the persisted remote permission and the effective AUTO
+state. Effective AUTO requires both the physical selector and remote permission:
+
+```text
+effective AUTO = physical AUTO switch AND remote AUTO permit
+```
+
+Remote OFF is persisted by the Nano in FRAM. On firmware upgrade the new permit
+defaults to ON so existing behavior is preserved. A deliberate physical
+OFF -> AUTO cycle locally clears a remote inhibit, which preserves local recovery
+if the ESP32, Wi-Fi, MQTT, or Home Assistant is unavailable.
+
 ## Safety boundary
 
-The ESP32 does not issue compressor control commands. CAN starts in listen-only mode. Nano UART is receive-only in Phase 1.
+The ESP32 cannot directly command engine start, Master, Start/Stop, Unloader,
+Idle, Kill, or Reset through MQTT. CAN remains listen-only. The Nano remains the
+authoritative controller and is not dependent on the ESP32 for safe operation.
