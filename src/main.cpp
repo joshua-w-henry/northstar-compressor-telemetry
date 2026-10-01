@@ -54,6 +54,24 @@ uint32_t canLogDropCount = 0;
 uint32_t nanoLineCount = 0;
 uint16_t engineRpm = 0;
 
+struct EcuCanTelemetry {
+  bool engineRpmValid = false;
+  bool requestedRpmValid = false;
+  bool mapValid = false;
+  bool tpsValid = false;
+  bool iatValid = false;
+  bool engineTempValid = false;
+
+  uint16_t engineRpm = 0;
+  uint16_t requestedRpm = 0;
+  float mapKpa = 0.0f;
+  float tpsPercent = 0.0f;
+  float iatC = 0.0f;
+  float engineTempC = 0.0f;
+};
+
+EcuCanTelemetry ecuCan;
+
 uint32_t sdMountAttempts = 0;
 uint32_t sdMountFailures = 0;
 uint32_t sdWriteErrors = 0;
@@ -467,18 +485,100 @@ static bool startTwai() {
   return true;
 }
 
+static uint16_t canU16Be(const twai_message_t& msg, uint8_t index) {
+  return ((uint16_t)msg.data[index] << 8) | msg.data[index + 1];
+}
+
+static void decodeEcuCan(const twai_message_t& msg) {
+  if (!msg.extd) return;
+
+  switch (msg.identifier) {
+    case CAN_ID_ENGINE_RPM:
+      if (msg.data_length_code >= 4) {
+        const uint16_t rpm = canU16Be(msg, 2);
+        // Field logs occasionally contain obvious transient garbage well above
+        // the engine's usable range. Preserve the original <=4000 RPM guard.
+        if (rpm <= 4000) {
+          engineRpm = rpm;
+          ecuCan.engineRpm = rpm;
+          ecuCan.engineRpmValid = true;
+        }
+      }
+      break;
+
+    case CAN_ID_REQUESTED_RPM:
+      if (msg.data_length_code >= 2) {
+        const uint16_t rpm = canU16Be(msg, 0);
+        if (rpm <= 5000) {
+          ecuCan.requestedRpm = rpm;
+          ecuCan.requestedRpmValid = true;
+        }
+      }
+      break;
+
+    case CAN_ID_MAP:
+      if (msg.data_length_code >= 2) {
+        const uint16_t raw = canU16Be(msg, 0);
+        // Decode observed in the field logs: raw / 100 = kPa.
+        if (raw > 0 && raw <= 20000) {
+          ecuCan.mapKpa = raw / 100.0f;
+          ecuCan.mapValid = true;
+        }
+      }
+      break;
+
+    case CAN_ID_TPS:
+      if (msg.data_length_code >= 8) {
+        const uint16_t raw = canU16Be(msg, 6);
+        // Provisional decode: raw / 100 = percent. Keep this visible in HA so
+        // deliberate throttle sweeps can confirm or falsify the mapping.
+        if (raw <= 10000) {
+          ecuCan.tpsPercent = raw / 100.0f;
+          ecuCan.tpsValid = true;
+        }
+      }
+      break;
+
+    case CAN_ID_IAT:
+      if (msg.data_length_code >= 6) {
+        const uint16_t raw = canU16Be(msg, 4);
+        // NorthStar-style temperature scaling observed in field logs:
+        // degC = (raw - 400) / 10.
+        if (raw > 0) {
+          const float c = ((int32_t)raw - 400) / 10.0f;
+          if (c >= -40.0f && c <= 150.0f) {
+            ecuCan.iatC = c;
+            ecuCan.iatValid = true;
+          }
+        }
+      }
+      break;
+
+    case CAN_ID_ENGINE_TEMP:
+      if (msg.data_length_code >= 6) {
+        const uint16_t raw = canU16Be(msg, 4);
+        if (raw > 0) {
+          const float c = ((int32_t)raw - 400) / 10.0f;
+          if (c >= -40.0f && c <= 200.0f) {
+            ecuCan.engineTempC = c;
+            ecuCan.engineTempValid = true;
+          }
+        }
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
 static void processCan() {
   if (!twaiReady) return;
 
   twai_message_t msg;
   while (twai_receive(&msg, 0) == ESP_OK) {
     ++canRxCount;
-
-    if (msg.extd && msg.identifier == RPM_CAN_ID && msg.data_length_code >= 4) {
-      const uint16_t rpm = ((uint16_t)msg.data[2] << 8) | msg.data[3];
-      if (rpm <= 4000) engineRpm = rpm;
-    }
-
+    decodeEcuCan(msg);
     logCanFrame(msg);
   }
 
@@ -963,6 +1063,30 @@ static void publishHaDiscovery() {
       ",\"unit_of_measurement\":\"rpm\",\"state_class\":\"measurement\"");
 
   publishHaDiscoveryEntity(
+      "sensor", "can_engine_rpm", "CAN Engine RPM", "can/engine_rpm",
+      ",\"unit_of_measurement\":\"rpm\",\"state_class\":\"measurement\"");
+
+  publishHaDiscoveryEntity(
+      "sensor", "requested_rpm", "Requested RPM", "can/requested_rpm",
+      ",\"unit_of_measurement\":\"rpm\",\"state_class\":\"measurement\"");
+
+  publishHaDiscoveryEntity(
+      "sensor", "map_kpa", "MAP", "can/map_kpa",
+      ",\"device_class\":\"pressure\",\"unit_of_measurement\":\"kPa\",\"state_class\":\"measurement\"");
+
+  publishHaDiscoveryEntity(
+      "sensor", "tps_percent", "TPS", "can/tps_percent",
+      ",\"unit_of_measurement\":\"%\",\"state_class\":\"measurement\"");
+
+  publishHaDiscoveryEntity(
+      "sensor", "iat", "Intake Air Temperature", "can/iat_c",
+      ",\"device_class\":\"temperature\",\"unit_of_measurement\":\"°C\",\"state_class\":\"measurement\"");
+
+  publishHaDiscoveryEntity(
+      "sensor", "engine_temperature", "Engine Temperature", "can/engine_temp_c",
+      ",\"device_class\":\"temperature\",\"unit_of_measurement\":\"°C\",\"state_class\":\"measurement\"");
+
+  publishHaDiscoveryEntity(
       "sensor", "pressure_psi", "Tank Pressure", "pressure_psi",
       ",\"device_class\":\"pressure\",\"unit_of_measurement\":\"psi\",\"state_class\":\"measurement\"");
 
@@ -1116,6 +1240,36 @@ static void publishFast() {
   const uint16_t rpm = controllerStatus.valid ? controllerStatus.rpm : engineRpm;
   snprintf(payload, sizeof(payload), "%u", rpm);
   publishText("rpm", payload, false);
+
+  if (ecuCan.engineRpmValid) {
+    snprintf(payload, sizeof(payload), "%u", ecuCan.engineRpm);
+    publishText("can/engine_rpm", payload, false);
+  }
+
+  if (ecuCan.requestedRpmValid) {
+    snprintf(payload, sizeof(payload), "%u", ecuCan.requestedRpm);
+    publishText("can/requested_rpm", payload, false);
+  }
+
+  if (ecuCan.mapValid) {
+    snprintf(payload, sizeof(payload), "%.2f", ecuCan.mapKpa);
+    publishText("can/map_kpa", payload, false);
+  }
+
+  if (ecuCan.tpsValid) {
+    snprintf(payload, sizeof(payload), "%.2f", ecuCan.tpsPercent);
+    publishText("can/tps_percent", payload, false);
+  }
+
+  if (ecuCan.iatValid) {
+    snprintf(payload, sizeof(payload), "%.1f", ecuCan.iatC);
+    publishText("can/iat_c", payload, false);
+  }
+
+  if (ecuCan.engineTempValid) {
+    snprintf(payload, sizeof(payload), "%.1f", ecuCan.engineTempC);
+    publishText("can/engine_temp_c", payload, false);
+  }
 }
 
 static void publishSlow() {
