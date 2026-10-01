@@ -506,16 +506,6 @@ static void decodeEcuCan(const twai_message_t& msg) {
       }
       break;
 
-    case CAN_ID_REQUESTED_RPM:
-      if (msg.data_length_code >= 2) {
-        const uint16_t rpm = canU16Be(msg, 0);
-        if (rpm <= 5000) {
-          ecuCan.requestedRpm = rpm;
-          ecuCan.requestedRpmValid = true;
-        }
-      }
-      break;
-
     case CAN_ID_MAP:
       if (msg.data_length_code >= 2) {
         const uint16_t raw = canU16Be(msg, 0);
@@ -540,16 +530,24 @@ static void decodeEcuCan(const twai_message_t& msg) {
       break;
 
     case CAN_ID_IAT:
+      // This frame carries at least two independently verified signals:
+      //   D4:D5 = IAT, degC = (raw - 400) / 10
+      //   D6:D7 = ECU RPM target/setpoint, direct RPM
       if (msg.data_length_code >= 6) {
         const uint16_t raw = canU16Be(msg, 4);
-        // NorthStar-style temperature scaling observed in field logs:
-        // degC = (raw - 400) / 10.
         if (raw > 0) {
           const float c = ((int32_t)raw - 400) / 10.0f;
           if (c >= -40.0f && c <= 150.0f) {
             ecuCan.iatC = c;
             ecuCan.iatValid = true;
           }
+        }
+      }
+      if (msg.data_length_code >= 8) {
+        const uint16_t rpmTarget = canU16Be(msg, 6);
+        if (rpmTarget <= 5000) {
+          ecuCan.requestedRpm = rpmTarget;
+          ecuCan.requestedRpmValid = true;
         }
       }
       break;
@@ -1067,7 +1065,7 @@ static void publishHaDiscovery() {
       ",\"unit_of_measurement\":\"rpm\",\"state_class\":\"measurement\"");
 
   publishHaDiscoveryEntity(
-      "sensor", "requested_rpm", "Requested RPM", "can/requested_rpm",
+      "sensor", "requested_rpm", "ECU Target RPM", "can/requested_rpm",
       ",\"unit_of_measurement\":\"rpm\",\"state_class\":\"measurement\"");
 
   publishHaDiscoveryEntity(
