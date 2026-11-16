@@ -1455,9 +1455,9 @@ static void serviceOta() {
     ArduinoOTA.setHostname("northstar-compressor");
     ArduinoOTA.setPassword(OTA_PASSWORD);
     ArduinoOTA.onStart([]() {
-      // Nano remains autonomous. Keep its physical selector OFF throughout.
+      // Nano remains autonomous. Keep engine stopped and AUTO inhibited.
       flushLogsNow();
-      Serial.println("OTA firmware transfer started; keep selector OFF");
+      Serial.println("OTA transfer started; keep engine stopped and AUTO inhibited");
     });
     ArduinoOTA.onEnd([]() { Serial.println("OTA transfer complete; rebooting"); });
     ArduinoOTA.onError([](ota_error_t error) {
