@@ -6,9 +6,9 @@ the independent, authoritative compressor controller.
 ## One-time setup (USB flash)
 
 1. On ShopDell, open the repository in VS Code with PlatformIO.
-2. Check out the `feature/guarded-esp32-ota` branch. If the branch is not
+2. Check out the `feature/ota-maintenance-override` branch. If the branch is not
    visible locally, `git fetch origin` then
-   `git switch --track origin/feature/guarded-esp32-ota`.
+   `git switch --track origin/feature/ota-maintenance-override`.
 3. Ensure the ignored `include/secrets.h` contains working Wi-Fi and MQTT
    values. Add a unique 12+ character password:
 
@@ -30,7 +30,8 @@ the independent, authoritative compressor controller.
 
 ## Subsequent Wi-Fi uploads (ShopDell / PowerShell)
 
-While the selector is **OFF**, engine stopped, and Nano UART status fresh:
+With the engine **stopped**, Nano telemetry fresh, and AUTO inhibited, preferably
+with the physical selector **OFF**:
 
 ```powershell
 # Run from the repository folder. Read-Host avoids putting the password
@@ -54,19 +55,23 @@ match. The OTA upload uses ESP32 port 3232 on the local network.
 
 OTA **never runs without**:
 
-- Wi-Fi and a local non-placeholder OTA password
-- Valid Nano `STATUS` received within 2.5 seconds
-- The Nano's physical selector reporting `sw=OFF`
+- Wi-Fi and a local non-placeholder OTA password (12+ characters)
+- Valid Nano `STATUS` received within 10 seconds
 - Nano reporting `run=N`, `rpm=0`, and both Master and Start/Stop outputs 0
 - No recently reported **nonzero** engine RPM over CAN
+- **Either** physical selector `sw=OFF` (normal mode), **or** an active,
+  explicitly armed five-minute maintenance override with Nano-reported
+  `rmt=OFF` and `eff=OFF`
 
 The ESP32 only handles OTA invitations when all these checks pass; otherwise,
 the network upload will time out. Loss of Nano serial telemetry fails closed.
-The Home Assistant `OTA Ready` entity indicates the current interlock state;
-this is not a substitute for visually verifying the physical selector.
+`OTA Ready` indicates readiness; `OTA Block Reason` explains a rejection.
+This is not a substitute for visually verifying the physical selector.
 
-**Important:** The ESP32 cannot mechanically lock the selector OFF. Do not
-toggle AUTO or attempt to start the engine during a transfer. OTA writing can
+**Important:** The ESP32 cannot mechanically lock the selector OFF or prevent a
+local operator from restoring AUTO. Even if maintenance override is used,
+physically leave the selector OFF whenever possible; do not toggle it or
+attempt to start the engine during a transfer. OTA writing can
 temporarily block the ESP32 logger loop and may create a short gap in CAN/UART
 logging. The Nano continues operating independently. OTA is not a control or
 safety channel.
@@ -74,6 +79,40 @@ safety channel.
 Do not port-forward ESP32 OTA or the log HTTP server. ArduinoOTA password
 authentication is **not** signed-firmware verification or a full encrypted
 update channel. Restrict access to trusted local network clients.
+
+## Home Assistant manual software override (five minutes)
+
+This is an **OTA reception override**, **not** a compressor control override.
+
+When running the new firmware:
+
+1. Confirm the compressor is stopped and its outputs are OFF.
+2. Set `Remote Auto` to **OFF**, then wait until `Effective Auto` is **OFF**.
+3. Prefer the physical selector **OFF**. If the selector cannot be taken OFF,
+   the new `OTA Maintenance Override` switch may temporarily bypass only
+   this selector check. Do not use it while the compressor is in service.
+4. Turn `OTA Maintenance Override` **ON** in Home Assistant. It switches OFF
+   automatically after **five minutes**, on reboot, MQTT reconnect, expired
+   Nano status, engine activity, or loss of the Nano AUTO inhibit.
+5. Confirm `OTA Ready = ON`. Run the ShopDell OTA upload command above.
+
+Topics:
+- `wayne/compressor/ota/maintenance/set`: `ON` or `OFF` (never retained)
+- `wayne/compressor/ota/maintenance/state`: auto-expiring `ON`/`OFF`
+- `wayne/compressor/ota/block_reason`: e.g. `password_missing`,
+  `nano_status_stale`, `engine_or_output_active`,
+  `selector_not_off`, `ready`, `ready_override`
+
+No additional Nano commands are sent when the override switch is toggled.
+For safety, do not use the override as a substitute for shutting off the
+compressor locally.
+
+**Bootstrap limitation:** An ESP32 already reporting `OTA Ready = OFF` may
+not answer OTA requests, because its old firmware deliberately does not call
+`ArduinoOTA.handle()`. It cannot receive a fix or this override over
+Wi-Fi until its existing OTA listener/interlocks actually allow one. If
+`OTA_PASSWORD` was omitted on the previous USB flash, USB is mandatory.
+Check the serial monitor and local credentials before attempting OTA.
 
 ## If it does not work
 
@@ -89,6 +128,7 @@ update channel. Restrict access to trusted local network clients.
 
 ## Branch note
 
-This was developed from `can-ecu-telemetry-ha` (four commits ahead of `main`
-at the time work began). Do not accidentally replace it with older `main`
-firmware. Before merging, build and validate on ShopDell and test the interlocks.
+This maintenance branch builds on `feature/guarded-esp32-ota`, which itself
+builds on `can-ecu-telemetry-ha`. Do not replace it with older `main` firmware.
+Before merging, build and validate on ShopDell and test both normal and
+maintenance interlocks.
