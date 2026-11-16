@@ -51,6 +51,8 @@ bool wifiWasConnected = false;
 bool ntpStarted = false;
 bool otaStarted = false;
 bool otaPasswordWarningPrinted = false;
+bool otaMaintenanceArmed = false;
+uint32_t otaMaintenanceExpiresAtMs = 0;
 
 uint8_t wifiIndex = 0;
 uint16_t sessionNumber = 0;
@@ -119,6 +121,10 @@ uint32_t nanoStatusParseError = 0;
 uint32_t lastNanoStatusMs = 0;
 uint32_t lastCanEngineRpmMs = 0;
 static bool otaSafeToStart();
+static bool otaMaintenanceActive();
+static bool otaMaintenanceArmingAllowed();
+static bool otaControllerIdle();
+static const char* otaBlockReason();
 
 unsigned long wifiAttemptStartedMs = 0;
 unsigned long wifiNextAttemptMs = 0;
@@ -1151,6 +1157,20 @@ static void publishHaDiscovery() {
       ",\"state_class\":\"total_increasing\",\"entity_category\":\"diagnostic\"");
 
   publishHaDiscoveryEntity(
+      "sensor", "ota_block_reason", "OTA Block Reason", "ota/block_reason",
+      ",\"entity_category\":\"diagnostic\"");
+
+  char otaOverrideExtra[256];
+  snprintf(otaOverrideExtra, sizeof(otaOverrideExtra),
+           ",\"command_topic\":\"%s/ota/maintenance/set\","
+           "\"payload_on\":\"ON\",\"payload_off\":\"OFF\","
+           "\"entity_category\":\"config\",\"icon\":\"mdi:timer-cog-outline\"",
+           MQTT_BASE_TOPIC);
+  publishHaDiscoveryEntity(
+      "switch", "ota_maintenance_override", "OTA Maintenance Override",
+      "ota/maintenance/state", otaOverrideExtra);
+
+  publishHaDiscoveryEntity(
       "binary_sensor", "ota_ready", "OTA Ready", "ota/ready",
       ",\"payload_on\":\"true\",\"payload_off\":\"false\",\"entity_category\":\"diagnostic\"");
 
@@ -1184,8 +1204,10 @@ static void sendNanoCommand(const char* command) {
 }
 
 static void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
-  const String commandTopic = String(MQTT_BASE_TOPIC) + "/remote_auto/set";
-  if (strcmp(topic, commandTopic.c_str())) return;
+  const String remoteAutoTopic = String(MQTT_BASE_TOPIC) + "/remote_auto/set";
+  const String maintenanceTopic = String(MQTT_BASE_TOPIC) + "/ota/maintenance/set";
+  if (strcmp(topic, remoteAutoTopic.c_str()) != 0 &&
+      strcmp(topic, maintenanceTopic.c_str()) != 0) return;
 
   char value[12];
   const unsigned int n = length < sizeof(value) - 1 ? length : sizeof(value) - 1;
@@ -1193,6 +1215,23 @@ static void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
     value[i] = (char)toupper((unsigned char)payload[i]);
   }
   value[n] = 0;
+
+  if (strcmp(topic, maintenanceTopic.c_str()) == 0) {
+    if (!strcmp(value, "OFF")) {
+      otaMaintenanceArmed = false;
+      publishText("ota/maintenance/state", "OFF", true);
+      Serial.println("OTA maintenance override disarmed");
+    } else if (!strcmp(value, "ON") && otaMaintenanceArmingAllowed()) {
+      otaMaintenanceArmed = true;
+      otaMaintenanceExpiresAtMs = millis() + OTA_MAINTENANCE_WINDOW_MS;
+      publishText("ota/maintenance/state", "ON", true);
+      Serial.println("OTA maintenance override armed for 5 minutes");
+    } else {
+      publishText("ota/maintenance/state", "OFF", true);
+      Serial.printf("OTA maintenance override refused: %s\n", otaBlockReason());
+    }
+    return;
+  }
 
   if (!strcmp(value, "ON")) {
     sendNanoCommand("remote auto on");
@@ -1221,6 +1260,11 @@ static void connectMqtt() {
     const String remoteAutoCommandTopic =
         String(MQTT_BASE_TOPIC) + "/remote_auto/set";
     mqtt.subscribe(remoteAutoCommandTopic.c_str());
+    const String maintenanceCommandTopic =
+        String(MQTT_BASE_TOPIC) + "/ota/maintenance/set";
+    mqtt.subscribe(maintenanceCommandTopic.c_str());
+    otaMaintenanceArmed = false;  // Require a fresh explicit command after reconnect.
+    publishText("ota/maintenance/state", "OFF", true);
 
     publishHaDiscovery();
     const String ipAddress = WiFi.localIP().toString();
@@ -1317,6 +1361,8 @@ static void publishSlow() {
   snprintf(payload, sizeof(payload), "%d", WiFi.RSSI());
   publishText("wifi/rssi", payload, false);
   publishText("ota/ready", otaStarted && otaSafeToStart() ? "true" : "false", false);
+  publishText("ota/block_reason", otaBlockReason(), false);
+  publishText("ota/maintenance/state", otaMaintenanceActive() ? "ON" : "OFF", true);
 
   if (now - lastSdHealthPublishMs >= SD_HEALTH_PERIOD_MS) {
     lastSdHealthPublishMs = now;
@@ -1329,27 +1375,63 @@ static bool otaPasswordConfigured() {
   return strlen(OTA_PASSWORD) >= 12 && strcmp(OTA_PASSWORD, "CHANGE_ME") != 0;
 }
 
-// Fail closed until recent Nano status confirms the physical selector is OFF,
-// engine stopped, and neither start nor master output energized.
-// Fresh CAN RPM provides an additional veto, never an alternative to Nano.
-static bool otaSafeToStart() {
+// A manually armed software maintenance window lasts at most five minutes,
+// and never persists across ESP32 reboot or MQTT reconnection.
+static bool otaMaintenanceActive() {
+  return otaMaintenanceArmed &&
+         (int32_t)(millis() - otaMaintenanceExpiresAtMs) < 0;
+}
+
+// Even under override, fresh Nano data must show a stopped engine and no
+// energized starter/master output. CAN RPM is an independent veto.
+static bool otaControllerIdle() {
   const uint32_t now = millis();
-  if (!controllerStatus.valid || now - lastNanoStatusMs > OTA_NANO_STATUS_MAX_AGE_MS) {
-    return false;
-  }
-  if (strcmp(controllerStatus.autoSwitch, "OFF") != 0 ||
-      strcmp(controllerStatus.running, "N") != 0 ||
-      controllerStatus.rpm != 0 ||
-      controllerStatus.master != 0 ||
-      controllerStatus.startStop != 0) {
-    return false;
-  }
+  if (!controllerStatus.valid ||
+      now - lastNanoStatusMs > OTA_NANO_STATUS_MAX_AGE_MS) return false;
+  if (strcmp(controllerStatus.running, "N") != 0 ||
+      controllerStatus.rpm != 0 || controllerStatus.master != 0 ||
+      controllerStatus.startStop != 0) return false;
   if (ecuCan.engineRpmValid &&
       now - lastCanEngineRpmMs <= OTA_CAN_RPM_MAX_AGE_MS &&
-      ecuCan.engineRpm != 0) {
-    return false;
-  }
+      ecuCan.engineRpm != 0) return false;
   return true;
+}
+
+// Permit maintenance override only with Nano AUTO permission explicitly
+// inhibited. This bypasses the physical selector check, NOT stopped-engine
+// checks, Nano telemetry freshness, or OTA password authentication.
+static bool otaMaintenanceArmingAllowed() {
+  return otaPasswordConfigured() && otaStarted && mqtt.connected() &&
+         otaControllerIdle() &&
+         strcmp(controllerStatus.remoteAuto, "OFF") == 0 &&
+         strcmp(controllerStatus.effectiveAuto, "OFF") == 0;
+}
+
+static const char* otaBlockReason() {
+  if (!otaPasswordConfigured()) return "password_missing";
+  if (WiFi.status() != WL_CONNECTED) return "wifi_disconnected";
+  if (!otaStarted) return "listener_not_started";
+  if (!controllerStatus.valid) return "nano_status_missing";
+  if (millis() - lastNanoStatusMs > OTA_NANO_STATUS_MAX_AGE_MS) return "nano_status_stale";
+  if (!otaControllerIdle()) return "engine_or_output_active";
+  if (strcmp(controllerStatus.autoSwitch, "OFF") == 0) return "ready";
+  if (otaMaintenanceActive() &&
+      strcmp(controllerStatus.remoteAuto, "OFF") == 0 &&
+      strcmp(controllerStatus.effectiveAuto, "OFF") == 0) return "ready_override";
+  return "selector_not_off";
+}
+
+static bool otaSafeToStart() {
+  const char* reason = otaBlockReason();
+  return !strcmp(reason, "ready") || !strcmp(reason, "ready_override");
+}
+
+static void serviceOtaMaintenance() {
+  if (!otaMaintenanceArmed) return;
+  if (otaMaintenanceActive() && otaMaintenanceArmingAllowed()) return;
+  otaMaintenanceArmed = false;
+  publishText("ota/maintenance/state", "OFF", true);
+  Serial.println("OTA maintenance override expired or idle/interlock lost");
 }
 
 static void serviceOta() {
@@ -1383,11 +1465,12 @@ static void serviceOta() {
     });
     ArduinoOTA.begin();
     otaStarted = true;
-    Serial.println("OTA listener ready (requires fresh Nano status with selector OFF)");
+    Serial.println("OTA listener ready (physical OFF or manual maintenance override required)");
   }
 
-  // No OTA handling when selector ON, Nano status missing/stale, outputs
-  // energized, or any fresh nonzero RPM. Never command the Nano from OTA.
+  // Manual override only relaxes the physical selector check while Nano
+  // remote/effective AUTO are OFF. Engine/output checks never disappear.
+  serviceOtaMaintenance();
   if (otaSafeToStart()) {
     ArduinoOTA.handle();
   }
