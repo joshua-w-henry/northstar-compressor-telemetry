@@ -41,6 +41,18 @@ onboard USB-serial interface also biases RX0. The measured RX node was about
 8. Manual read-only SD log pull over local HTTP
 9. Limited Home Assistant remote AUTO permit ON/OFF
 
+## Guarded ESP32 OTA updates
+
+The ESP32-S3 supports password-protected ArduinoOTA updates after an initial
+USB flash. OTA requests are handled only when recent Nano telemetry confirms
+the **physical AUTO/OFF selector is OFF**, engine is stopped, and start/master
+outputs are de-energized. A fresh nonzero CAN RPM sample also blocks OTA.
+No controller/Nano actuation is performed during OTA.
+
+Home Assistant exposes `OTA Ready` as a diagnostic binary sensor.
+See [docs/ota.md](docs/ota.md) for the ShopDell PlatformIO procedure,
+local password setup, and safety limitations.
+
 ## SD log file pull
 
 When the ESP32-S3 is connected to Wi-Fi, it exposes a small **read-only**
