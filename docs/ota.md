@@ -10,14 +10,15 @@ the independent, authoritative compressor controller.
    visible locally, `git fetch origin` then
    `git switch --track origin/feature/ota-maintenance-override`.
 3. Ensure the ignored `include/secrets.h` contains working Wi-Fi and MQTT
-   values. Add a unique 12+ character password:
+   values. Add a non-empty password of your choice (no length or special-character policy):
 
    ```cpp
-   #define OTA_PASSWORD "REPLACE_WITH_YOUR_OWN_LONG_RANDOM_PASSWORD"
+   #define OTA_PASSWORD "REPLACE_WITH_YOUR_PASSWORD"
    ```
 
-   Do **not** use the placeholder literally, reuse any other service password,
-   or commit `secrets.h`. Without a configured password, OTA is disabled.
+   Do **not** use the example placeholder, reuse service passwords, or commit
+   `secrets.h`. Passwords of any length are accepted, but a long unique one
+   is still recommended. Without a configured password, OTA is disabled.
 4. Physically turn the compressor's **AUTO/OFF selector to OFF**, verify the
    engine is fully stopped, and leave the selector OFF throughout the upload.
 5. First build: `pio run -e esp32-s3-devkitc-1`.
@@ -55,7 +56,7 @@ match. The OTA upload uses ESP32 port 3232 on the local network.
 
 OTA **never runs without**:
 
-- Wi-Fi and a local non-placeholder OTA password (12+ characters)
+- Wi-Fi and a non-empty, non-placeholder OTA password
 - Valid Nano `STATUS` received within 10 seconds
 - Nano reporting `run=N`, `rpm=0`, and both Master and Start/Stop outputs 0
 - No recently reported **nonzero** engine RPM over CAN
