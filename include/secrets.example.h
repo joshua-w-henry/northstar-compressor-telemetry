@@ -17,6 +17,6 @@
 #define MQTT_CLIENT_ID "northstar-compressor-telemetry"
 #define MQTT_BASE_TOPIC "wayne/compressor"
 
-// Use a UNIQUE 12+ character secret in ignored secrets.h.
+// Set any non-empty custom password in ignored secrets.h (no minimum length).
 // Missing/placeholder value disables OTA entirely.
 #define OTA_PASSWORD "CHANGE_ME"

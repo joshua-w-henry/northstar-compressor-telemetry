@@ -20,10 +20,12 @@ constexpr uint32_t SD_HEALTH_PERIOD_MS = 30000;
 constexpr uint32_t SD_HOTPLUG_POLL_MS = 5000;
 constexpr uint16_t SD_HTTP_PORT = 80;
 
-// OTA invitations are accepted only with a recently confirmed, physical OFF
-// state from the Nano. An optional recent ECU RPM sample may veto an update.
-constexpr uint32_t OTA_NANO_STATUS_MAX_AGE_MS = 2500;
+// Nano STATUS must remain fresh. Allow up to 10 seconds to accommodate
+// status intervals / brief scheduling stalls, while failing closed on loss.
+constexpr uint32_t OTA_NANO_STATUS_MAX_AGE_MS = 10000;
 constexpr uint32_t OTA_CAN_RPM_MAX_AGE_MS = 2500;
+// Temporary software maintenance override automatically expires in 5 min.
+constexpr uint32_t OTA_MAINTENANCE_WINDOW_MS = 5UL * 60UL * 1000UL;
 
 // NorthStar e420 ECU CAN telemetry IDs decoded from field logs.
 constexpr uint32_t CAN_ID_ENGINE_RPM    = 0x0C665500UL;
