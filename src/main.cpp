@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <ArduinoOTA.h>
 #include <WebServer.h>
 #include <PubSubClient.h>
 #include <driver/twai.h>
@@ -28,6 +29,11 @@
 #define MQTT_BASE_TOPIC "wayne/compressor"
 #endif
 
+// Never enable unauthenticated OTA. Define this in ignored include/secrets.h.
+#ifndef OTA_PASSWORD
+#define OTA_PASSWORD ""
+#endif
+
 HardwareSerial NanoSerial(1);
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
@@ -43,6 +49,8 @@ bool sdReady = false;
 bool wifiAttemptActive = false;
 bool wifiWasConnected = false;
 bool ntpStarted = false;
+bool otaStarted = false;
+bool otaPasswordWarningPrinted = false;
 
 uint8_t wifiIndex = 0;
 uint16_t sessionNumber = 0;
@@ -108,6 +116,9 @@ struct ControllerStatus {
 ControllerStatus controllerStatus;
 uint32_t nanoStatusParseOk = 0;
 uint32_t nanoStatusParseError = 0;
+uint32_t lastNanoStatusMs = 0;
+uint32_t lastCanEngineRpmMs = 0;
+static bool otaSafeToStart();
 
 unsigned long wifiAttemptStartedMs = 0;
 unsigned long wifiNextAttemptMs = 0;
@@ -502,6 +513,7 @@ static void decodeEcuCan(const twai_message_t& msg) {
           engineRpm = rpm;
           ecuCan.engineRpm = rpm;
           ecuCan.engineRpmValid = true;
+          lastCanEngineRpmMs = millis();
         }
       }
       break;
@@ -691,6 +703,7 @@ static bool parseControllerStatus(const char* line) {
 
   parsed.valid = true;
   controllerStatus = parsed;
+  lastNanoStatusMs = millis();
   ++nanoStatusParseOk;
   publishControllerState();
   return true;
@@ -1138,6 +1151,10 @@ static void publishHaDiscovery() {
       ",\"state_class\":\"total_increasing\",\"entity_category\":\"diagnostic\"");
 
   publishHaDiscoveryEntity(
+      "binary_sensor", "ota_ready", "OTA Ready", "ota/ready",
+      ",\"payload_on\":\"true\",\"payload_off\":\"false\",\"entity_category\":\"diagnostic\"");
+
+  publishHaDiscoveryEntity(
       "binary_sensor", "running", "Engine Running", "running",
       ",\"payload_on\":\"Y\",\"payload_off\":\"N\",\"device_class\":\"running\"");
   publishHaDiscoveryEntity(
@@ -1299,10 +1316,80 @@ static void publishSlow() {
 
   snprintf(payload, sizeof(payload), "%d", WiFi.RSSI());
   publishText("wifi/rssi", payload, false);
+  publishText("ota/ready", otaStarted && otaSafeToStart() ? "true" : "false", false);
 
   if (now - lastSdHealthPublishMs >= SD_HEALTH_PERIOD_MS) {
     lastSdHealthPublishMs = now;
     publishSdHealth();
+  }
+}
+
+
+static bool otaPasswordConfigured() {
+  return strlen(OTA_PASSWORD) >= 12 && strcmp(OTA_PASSWORD, "CHANGE_ME") != 0;
+}
+
+// Fail closed until recent Nano status confirms the physical selector is OFF,
+// engine stopped, and neither start nor master output energized.
+// Fresh CAN RPM provides an additional veto, never an alternative to Nano.
+static bool otaSafeToStart() {
+  const uint32_t now = millis();
+  if (!controllerStatus.valid || now - lastNanoStatusMs > OTA_NANO_STATUS_MAX_AGE_MS) {
+    return false;
+  }
+  if (strcmp(controllerStatus.autoSwitch, "OFF") != 0 ||
+      strcmp(controllerStatus.running, "N") != 0 ||
+      controllerStatus.rpm != 0 ||
+      controllerStatus.master != 0 ||
+      controllerStatus.startStop != 0) {
+    return false;
+  }
+  if (ecuCan.engineRpmValid &&
+      now - lastCanEngineRpmMs <= OTA_CAN_RPM_MAX_AGE_MS &&
+      ecuCan.engineRpm != 0) {
+    return false;
+  }
+  return true;
+}
+
+static void serviceOta() {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (otaStarted) {
+      ArduinoOTA.end();
+      otaStarted = false;
+    }
+    return;
+  }
+
+  if (!otaPasswordConfigured()) {
+    if (!otaPasswordWarningPrinted) {
+      Serial.println("OTA disabled: set a unique OTA_PASSWORD (12+ characters) in include/secrets.h");
+      otaPasswordWarningPrinted = true;
+    }
+    return;
+  }
+
+  if (!otaStarted) {
+    ArduinoOTA.setHostname("northstar-compressor");
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+    ArduinoOTA.onStart([]() {
+      // Nano remains autonomous. Keep its physical selector OFF throughout.
+      flushLogsNow();
+      Serial.println("OTA firmware transfer started; keep selector OFF");
+    });
+    ArduinoOTA.onEnd([]() { Serial.println("OTA transfer complete; rebooting"); });
+    ArduinoOTA.onError([](ota_error_t error) {
+      Serial.printf("OTA error: %u\n", static_cast<unsigned>(error));
+    });
+    ArduinoOTA.begin();
+    otaStarted = true;
+    Serial.println("OTA listener ready (requires fresh Nano status with selector OFF)");
+  }
+
+  // No OTA handling when selector ON, Nano status missing/stale, outputs
+  // energized, or any fresh nonzero RPM. Never command the Nano from OTA.
+  if (otaSafeToStart()) {
+    ArduinoOTA.handle();
   }
 }
 
@@ -1336,6 +1423,7 @@ void loop() {
   flushLogsIfDue();
 
   serviceWifi();
+  serviceOta();
   serviceSdFileServer();
   serviceMqtt();
 
