@@ -49,9 +49,13 @@ the **physical AUTO/OFF selector is OFF**, engine is stopped, and start/master
 outputs are de-energized. A fresh nonzero CAN RPM sample also blocks OTA.
 No controller/Nano actuation is performed during OTA.
 
-Home Assistant exposes `OTA Ready` as a diagnostic binary sensor.
-See [docs/ota.md](docs/ota.md) for the ShopDell PlatformIO procedure,
-local password setup, and safety limitations.
+Home Assistant exposes `OTA Ready` and `OTA Block Reason` diagnostics.
+A time-limited `OTA Maintenance Override` switch can temporarily relax
+the physical selector requirement **only** if fresh Nano telemetry shows
+the engine stopped, outputs de-energized, and both remote and effective
+AUTO permissions OFF. It never overrides password authentication or
+running-engine checks. See [docs/ota.md](docs/ota.md) for the ShopDell
+procedure, override limits, and recovery instructions.
 
 ## SD log file pull
 
