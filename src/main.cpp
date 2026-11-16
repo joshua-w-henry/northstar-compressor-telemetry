@@ -1372,7 +1372,9 @@ static void publishSlow() {
 
 
 static bool otaPasswordConfigured() {
-  return strlen(OTA_PASSWORD) >= 12 && strcmp(OTA_PASSWORD, "CHANGE_ME") != 0;
+  // Any non-empty custom password is valid; no length/complexity policy.
+  // Keep the example placeholder disabled to prevent accidental default access.
+  return OTA_PASSWORD[0] != '\0' && strcmp(OTA_PASSWORD, "CHANGE_ME") != 0;
 }
 
 // A manually armed software maintenance window lasts at most five minutes,
@@ -1445,7 +1447,7 @@ static void serviceOta() {
 
   if (!otaPasswordConfigured()) {
     if (!otaPasswordWarningPrinted) {
-      Serial.println("OTA disabled: set a unique OTA_PASSWORD (12+ characters) in include/secrets.h");
+      Serial.println("OTA disabled: define a non-empty custom OTA_PASSWORD in include/secrets.h");
       otaPasswordWarningPrinted = true;
     }
     return;
